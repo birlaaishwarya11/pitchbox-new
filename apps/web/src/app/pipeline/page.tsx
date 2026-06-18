@@ -6,6 +6,35 @@ const SERVER_BASE = process.env.NEXT_PUBLIC_SERVER_BASE || 'http://localhost:300
 
 type Status = 'CREATED' | 'PLANNING' | 'RESEARCHING' | 'SCRIPT_DRAFT' | 'GENERATING' | 'FUSING' | 'READY' | 'ERROR';
 
+type StageId = 'analyze' | 'plan' | 'research' | 'script' | 'record' | 'voiceover' | 'fuse';
+type StageStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
+type StageState = {
+  id: StageId;
+  label: string;
+  status: StageStatus;
+  message?: string;
+  startedAt?: string;
+  endedAt?: string;
+};
+
+// Mirrors the backend STAGE_DEFS (apps/server/src/pipelineStages.ts) for the
+// pre-launch selection panel. Required stages always run; optional ones toggle.
+const STAGE_META: {
+  id: StageId;
+  label: string;
+  group: 'Analyze' | 'Script' | 'Generate';
+  optional: boolean;
+  hint: string;
+}[] = [
+  { id: 'analyze', label: 'Analyze project', group: 'Analyze', optional: true, hint: 'Clone + inspect the repo (needs a GitHub URL)' },
+  { id: 'plan', label: 'Plan', group: 'Script', optional: false, hint: 'Decide the angle, audience, hook' },
+  { id: 'research', label: 'Research', group: 'Script', optional: true, hint: 'Use-case dos & don’ts' },
+  { id: 'script', label: 'Write script', group: 'Script', optional: false, hint: 'Draft the voiceover script' },
+  { id: 'record', label: 'Screen recording', group: 'Generate', optional: true, hint: 'Capture a live/public URL' },
+  { id: 'voiceover', label: 'Voiceover', group: 'Generate', optional: false, hint: 'ElevenLabs narration' },
+  { id: 'fuse', label: 'Assemble video', group: 'Generate', optional: false, hint: 'Mux audio onto the capture/slate' },
+];
+
 type ScriptVersion = {
   id: string;
   versionNumber: number;
@@ -22,7 +51,8 @@ type Session = {
   createdAt: string;
   updatedAt: string;
   status: Status;
-  input: { githubUrl?: string; branch?: string; userPrompt: string; targetDurationSec: number };
+  input: { githubUrl?: string; branch?: string; recordUrl?: string; userPrompt: string; targetDurationSec: number };
+  stages: StageState[];
   plan?: {
     audience: string;
     primaryGoal: string;
@@ -49,8 +79,6 @@ type Session = {
   error?: { stage: string; message: string };
 };
 
-const STAGE_ORDER: Status[] = ['PLANNING', 'RESEARCHING', 'SCRIPT_DRAFT', 'GENERATING', 'FUSING', 'READY'];
-
 export default function PipelinePage() {
   const [session, setSession] = useState<Session | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -58,8 +86,25 @@ export default function PipelinePage() {
   // Inputs
   const [userPrompt, setUserPrompt] = useState(SAMPLE_PROMPTS[0].value);
   const [githubUrl, setGithubUrl] = useState('');
+  const [recordUrl, setRecordUrl] = useState('');
   const [targetDurationSec, setTargetDurationSec] = useState(90);
-  const [skipRecording, setSkipRecording] = useState(true);
+  // Which optional stages to run. Required stages always run.
+  const [selectedOptional, setSelectedOptional] = useState<Set<StageId>>(
+    () => new Set<StageId>(['research', 'record']),
+  );
+  const recordSelected = selectedOptional.has('record');
+
+  const toggleOptional = (id: StageId) =>
+    setSelectedOptional((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+
+  const selectedStageIds = (): StageId[] => {
+    const ids = STAGE_META.filter((s) => !s.optional).map((s) => s.id);
+    return [...ids, ...selectedOptional];
+  };
 
   // Feedback box
   const [feedback, setFeedback] = useState('');
@@ -108,8 +153,10 @@ export default function PipelinePage() {
         body: JSON.stringify({
           userPrompt,
           githubUrl: githubUrl.trim() || undefined,
+          recordUrl: recordUrl.trim() || undefined,
           targetDurationSec,
-          skipRecording,
+          selectedStages: selectedStageIds(),
+          skipRecording: !recordSelected,
         }),
       });
       const data = await r.json();
@@ -150,7 +197,7 @@ export default function PipelinePage() {
       const r = await fetch(`${SERVER_BASE}/api/pipeline/${session.id}/approve`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ skipRecording }),
+        body: JSON.stringify({ skipRecording: !recordSelected }),
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
@@ -204,15 +251,17 @@ export default function PipelinePage() {
             setUserPrompt={setUserPrompt}
             githubUrl={githubUrl}
             setGithubUrl={setGithubUrl}
+            recordUrl={recordUrl}
+            setRecordUrl={setRecordUrl}
             targetDurationSec={targetDurationSec}
             setTargetDurationSec={setTargetDurationSec}
-            skipRecording={skipRecording}
-            setSkipRecording={setSkipRecording}
+            selectedOptional={selectedOptional}
+            toggleOptional={toggleOptional}
             onStart={handleStart}
           />
         )}
 
-        {session && <ProgressBar status={session.status} />}
+        {session && <AgentBoard stages={session.stages} status={session.status} />}
 
         {session && session.status !== 'READY' && session.status !== 'SCRIPT_DRAFT' && session.status !== 'ERROR' && (
           <PreparingCard session={session} />
@@ -226,8 +275,8 @@ export default function PipelinePage() {
             iterating={iterating}
             onFeedback={handleFeedback}
             onApprove={handleApprove}
-            skipRecording={skipRecording}
-            setSkipRecording={setSkipRecording}
+            recordSelected={recordSelected}
+            toggleRecord={() => toggleOptional('record')}
           />
         )}
 
@@ -275,12 +324,16 @@ function InputCard(props: {
   setUserPrompt: (v: string) => void;
   githubUrl: string;
   setGithubUrl: (v: string) => void;
+  recordUrl: string;
+  setRecordUrl: (v: string) => void;
   targetDurationSec: number;
   setTargetDurationSec: (v: number) => void;
-  skipRecording: boolean;
-  setSkipRecording: (v: boolean) => void;
+  selectedOptional: Set<StageId>;
+  toggleOptional: (id: StageId) => void;
   onStart: () => void;
 }) {
+  const analyzeOn = props.selectedOptional.has('analyze');
+  const recordOn = props.selectedOptional.has('record');
   return (
     <section className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5 space-y-4">
       <div>
@@ -310,12 +363,13 @@ function InputCard(props: {
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
         <div className="space-y-1.5">
-          <label className="text-xs text-zinc-400">GitHub URL (optional)</label>
+          <label className="text-xs text-zinc-400">Public URL to record {recordOn ? '' : '(recording off)'}</label>
           <input
-            value={props.githubUrl}
-            onChange={(e) => props.setGithubUrl(e.target.value)}
-            placeholder="https://github.com/owner/repo"
-            className="w-full rounded bg-zinc-950 border border-zinc-800 p-1.5 text-sm font-mono"
+            value={props.recordUrl}
+            onChange={(e) => props.setRecordUrl(e.target.value)}
+            placeholder="https://your-app.vercel.app"
+            className="w-full rounded bg-zinc-950 border border-zinc-800 p-1.5 text-sm font-mono disabled:opacity-40"
+            disabled={!recordOn}
           />
         </div>
         <div className="space-y-1.5">
@@ -331,14 +385,49 @@ function InputCard(props: {
         </div>
       </div>
 
-      <label className="flex items-center gap-2 text-xs text-zinc-400">
+      <div className="space-y-1.5">
+        <label className="text-xs text-zinc-400">GitHub URL {analyzeOn ? '(used by Analyze)' : '(optional)'}</label>
         <input
-          type="checkbox"
-          checked={props.skipRecording}
-          onChange={(e) => props.setSkipRecording(e.target.checked)}
+          value={props.githubUrl}
+          onChange={(e) => props.setGithubUrl(e.target.value)}
+          placeholder="https://github.com/owner/repo"
+          className="w-full rounded bg-zinc-950 border border-zinc-800 p-1.5 text-sm font-mono"
         />
-        Skip Daytona screen recording (use slate-only fallback for the final video)
-      </label>
+      </div>
+
+      {/* Stage-selection panel: pick which agents run before launch. */}
+      <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3 space-y-2">
+        <p className="text-xs uppercase tracking-widest text-zinc-500">Stages to run</p>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+          {STAGE_META.map((s) => {
+            const on = !s.optional || props.selectedOptional.has(s.id);
+            return (
+              <label
+                key={s.id}
+                className={`flex items-start gap-2 rounded border p-2 text-xs ${
+                  on ? 'border-zinc-700 bg-zinc-900/60' : 'border-zinc-800 bg-transparent opacity-60'
+                } ${s.optional ? 'cursor-pointer' : 'cursor-default'}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={on}
+                  disabled={!s.optional}
+                  onChange={() => s.optional && props.toggleOptional(s.id)}
+                  className="mt-0.5"
+                />
+                <span>
+                  <span className="text-zinc-200 font-medium">{s.label}</span>
+                  {!s.optional && <span className="ml-1 text-[10px] text-zinc-500">required</span>}
+                  <span className="block text-[10px] text-zinc-500">{s.hint}</span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+        {recordOn && !props.recordUrl.trim() && (
+          <p className="text-[11px] text-amber-400">Screen recording is on but no URL set — it’ll fall back to a slate.</p>
+        )}
+      </div>
 
       <div className="flex justify-end">
         <button
@@ -353,24 +442,73 @@ function InputCard(props: {
   );
 }
 
-function ProgressBar({ status }: { status: Status }) {
-  const idx = STAGE_ORDER.indexOf(status);
+const STATUS_STYLE: Record<StageStatus, { dot: string; border: string; text: string; label: string }> = {
+  pending: { dot: 'bg-zinc-600', border: 'border-zinc-800', text: 'text-zinc-400', label: 'Pending' },
+  running: { dot: 'bg-amber-400 animate-pulse', border: 'border-amber-600/70', text: 'text-amber-200', label: 'Running' },
+  done: { dot: 'bg-emerald-400', border: 'border-emerald-700/70', text: 'text-emerald-200', label: 'Done' },
+  failed: { dot: 'bg-rose-500', border: 'border-rose-700/70', text: 'text-rose-200', label: 'Failed' },
+  skipped: { dot: 'bg-zinc-700', border: 'border-zinc-800', text: 'text-zinc-600', label: 'Skipped' },
+};
+
+const GROUPS: { key: 'Analyze' | 'Script' | 'Generate'; title: string }[] = [
+  { key: 'Analyze', title: '1 · Analyze project' },
+  { key: 'Script', title: '2 · Script generation' },
+  { key: 'Generate', title: '3 · Generate video' },
+];
+
+function elapsed(s: StageState): string | null {
+  if (!s.startedAt) return null;
+  const end = s.endedAt ? new Date(s.endedAt).getTime() : Date.now();
+  const ms = end - new Date(s.startedAt).getTime();
+  if (ms < 0) return null;
+  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+}
+
+function AgentBoard({ stages, status }: { stages: StageState[]; status: Status }) {
   return (
-    <div className="flex items-center gap-2 text-xs">
-      {STAGE_ORDER.map((stage, i) => (
-        <span
-          key={stage}
-          className={`px-2 py-1 rounded border ${
-            i < idx
-              ? 'border-emerald-700 text-emerald-300'
-              : i === idx
-                ? 'border-amber-600 text-amber-300 animate-pulse'
-                : 'border-zinc-800 text-zinc-500'
-          }`}
-        >
-          {i + 1}. {stage}
+    <section className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5 space-y-4">
+      <div className="flex items-baseline justify-between">
+        <h2 className="text-lg font-semibold">Agents</h2>
+        <span className="text-[11px] text-zinc-500">
+          {status === 'READY' ? 'complete' : status === 'ERROR' ? 'stopped' : 'live · polling 1.5s'}
         </span>
-      ))}
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        {GROUPS.map((g) => {
+          const groupStages = stages.filter((st) => STAGE_META.find((m) => m.id === st.id)?.group === g.key);
+          if (groupStages.length === 0) return null;
+          return (
+            <div key={g.key} className="space-y-2">
+              <p className="text-[10px] uppercase tracking-widest text-zinc-500">{g.title}</p>
+              <div className="space-y-2">
+                {groupStages.map((st) => (
+                  <StageCard key={st.id} stage={st} />
+                ))}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function StageCard({ stage }: { stage: StageState }) {
+  const s = STATUS_STYLE[stage.status];
+  const t = elapsed(stage);
+  return (
+    <div className={`rounded-lg border ${s.border} bg-zinc-950/60 p-3`}>
+      <div className="flex items-center gap-2">
+        <span className={`inline-block h-2 w-2 rounded-full ${s.dot}`} />
+        <span className="text-sm text-zinc-200 font-medium">{stage.label}</span>
+        <span className={`ml-auto text-[10px] ${s.text}`}>{s.label}</span>
+      </div>
+      {stage.message && (
+        <p className="mt-1 text-[11px] text-zinc-400 break-words line-clamp-2">{stage.message}</p>
+      )}
+      {t && stage.status !== 'pending' && stage.status !== 'skipped' && (
+        <p className="mt-1 text-[10px] text-zinc-600">{t}</p>
+      )}
     </div>
   );
 }
@@ -452,8 +590,8 @@ function ScriptReviewCard(props: {
   iterating: boolean;
   onFeedback: () => void;
   onApprove: () => void;
-  skipRecording: boolean;
-  setSkipRecording: (v: boolean) => void;
+  recordSelected: boolean;
+  toggleRecord: () => void;
 }) {
   const latest = props.session.scriptVersions[props.session.scriptVersions.length - 1];
   if (!latest) return null;
@@ -514,12 +652,8 @@ function ScriptReviewCard(props: {
             {props.iterating ? 'Revising…' : 'Send feedback → revise'}
           </button>
           <label className="flex items-center gap-2 text-xs text-zinc-400 ml-auto">
-            <input
-              type="checkbox"
-              checked={props.skipRecording}
-              onChange={(e) => props.setSkipRecording(e.target.checked)}
-            />
-            slate-only
+            <input type="checkbox" checked={props.recordSelected} onChange={props.toggleRecord} />
+            screen recording
           </label>
           <button
             onClick={props.onApprove}

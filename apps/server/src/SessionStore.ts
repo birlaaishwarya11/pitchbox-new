@@ -1,6 +1,16 @@
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import path from 'node:path';
+import { STAGE_DEFS, type StageId, type StageStatus } from './pipelineStages';
+
+export interface StageState {
+  id: StageId;
+  label: string;
+  status: StageStatus;
+  message?: string;
+  startedAt?: string;
+  endedAt?: string;
+}
 
 export type PipelineStatus =
   | 'CREATED'
@@ -51,9 +61,12 @@ export interface PipelineSession {
   input: {
     githubUrl?: string;
     branch?: string;
+    recordUrl?: string;
     userPrompt: string;
     targetDurationSec: number;
   };
+  /** Per-stage execution status, driving the live progress board. */
+  stages: StageState[];
   plan?: PlanArtifact;
   research?: ResearchArtifact;
   scriptVersions: ScriptVersion[];
@@ -92,16 +105,22 @@ export class SessionStore {
     }
   }
 
-  create(input: PipelineSession['input']): PipelineSession {
+  create(input: PipelineSession['input'], selectedStages?: Set<StageId>): PipelineSession {
     const id = randomUUID();
     const workDir = path.join(this.rootDir, id);
     const now = new Date().toISOString();
+    const stages: StageState[] = STAGE_DEFS.map((def) => ({
+      id: def.id,
+      label: def.label,
+      status: selectedStages && !selectedStages.has(def.id) ? 'skipped' : 'pending',
+    }));
     const session: PipelineSession = {
       id,
       createdAt: now,
       updatedAt: now,
       status: 'CREATED',
       input,
+      stages,
       scriptVersions: [],
       workDir,
     };
@@ -144,6 +163,25 @@ export class SessionStore {
   setStatus(id: string, status: PipelineStatus): void {
     this.update(id, (s) => {
       s.status = status;
+    });
+  }
+
+  /** Patch one stage's state. Stamps startedAt/endedAt automatically on transitions. */
+  setStage(id: string, stageId: StageId, patch: Partial<Omit<StageState, 'id' | 'label'>>): void {
+    this.update(id, (s) => {
+      const stage = s.stages.find((st) => st.id === stageId);
+      if (!stage) return;
+      if (patch.status === 'running' && !stage.startedAt) stage.startedAt = new Date().toISOString();
+      if (patch.status === 'done' || patch.status === 'failed') stage.endedAt = new Date().toISOString();
+      Object.assign(stage, patch);
+    });
+  }
+
+  /** Mark a stage skipped (only if it has not already run). */
+  skipStage(id: string, stageId: StageId): void {
+    this.update(id, (s) => {
+      const stage = s.stages.find((st) => st.id === stageId);
+      if (stage && stage.status === 'pending') stage.status = 'skipped';
     });
   }
 

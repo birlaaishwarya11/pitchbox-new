@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { mkdir } from 'node:fs/promises';
+import { mkdir, copyFile } from 'node:fs/promises';
 import type { SessionStore, PipelineSession, ScriptVersion } from './SessionStore';
 import type { Planner } from './Planner';
 import type { Researcher } from './Researcher';
@@ -10,6 +10,8 @@ import type { RepositoryCloner } from './RepositoryCloner';
 import type { CodebaseAnalyzer, AnalysisResult } from './CodebaseAnalyzer';
 import type { FlowExtractor } from './FlowExtractor';
 import type { SandboxRecorder } from './SandboxRecorder';
+import type { Recorder } from './Recorder';
+import { resolveSelectedStages, type StageId } from './pipelineStages';
 
 export interface PipelineDeps {
   store: SessionStore;
@@ -22,6 +24,9 @@ export interface PipelineDeps {
   codebaseAnalyzer?: CodebaseAnalyzer;
   flowExtractor?: FlowExtractor;
   sandboxRecorder?: SandboxRecorder;
+  // Records a plain URL locally (Puppeteer + ffmpeg) — used when a deployed
+  // `recordUrl` is supplied instead of a GitHub repo + Daytona sandbox.
+  urlRecorder?: Recorder;
   // Public URL prefix for static-served session files. Final URLs become
   // `${publicMediaPrefix}/${sessionId}/<file>`.
   publicMediaPrefix: string;
@@ -30,9 +35,14 @@ export interface PipelineDeps {
 export interface StartInput {
   githubUrl?: string;
   branch?: string;
+  // A deployed/public URL to screen-record directly (no Daytona).
+  recordUrl?: string;
   userPrompt: string;
   targetDurationSec?: number;
-  // If true, skip the screen-recording leg even if Daytona is configured.
+  // Which optional stages to run. Required stages always run; dependencies are
+  // resolved automatically. Undefined = run everything.
+  selectedStages?: StageId[];
+  // If true, skip the screen-recording leg even if a target is available.
   skipRecording?: boolean;
 }
 
@@ -41,14 +51,19 @@ export class PipelineOrchestrator {
 
   /** Creates a session and kicks off plan + research + first script in the background. */
   start(input: StartInput): PipelineSession {
-    const session = this.deps.store.create({
-      githubUrl: input.githubUrl,
-      branch: input.branch,
-      userPrompt: input.userPrompt,
-      targetDurationSec: input.targetDurationSec ?? 90,
-    });
+    const selected = resolveSelectedStages(input.selectedStages);
+    const session = this.deps.store.create(
+      {
+        githubUrl: input.githubUrl,
+        branch: input.branch,
+        recordUrl: input.recordUrl,
+        userPrompt: input.userPrompt,
+        targetDurationSec: input.targetDurationSec ?? 90,
+      },
+      selected,
+    );
 
-    void this.runScriptStages(session.id, { skipRecording: input.skipRecording }).catch((err) => {
+    void this.runScriptStages(session.id, selected).catch((err) => {
       console.error(`[pipeline ${session.id}] script-stage failure:`, err);
       this.deps.store.setError(session.id, this.deps.store.get(session.id)?.status ?? 'PLANNING', String(err?.message ?? err));
     });
@@ -111,6 +126,15 @@ export class PipelineOrchestrator {
       s.video = undefined;
       s.finalVideo = undefined;
       s.error = undefined;
+      // Reset the media-phase stages so the board reflects a fresh run.
+      for (const stage of s.stages) {
+        if ((stage.id === 'record' || stage.id === 'voiceover' || stage.id === 'fuse') && stage.status !== 'skipped') {
+          stage.status = 'pending';
+          stage.message = undefined;
+          stage.startedAt = undefined;
+          stage.endedAt = undefined;
+        }
+      }
     });
   }
 
@@ -118,66 +142,93 @@ export class PipelineOrchestrator {
   // Internals
   // ---------------------------------------------------------------------------
 
-  private async runScriptStages(sessionId: string, opts: { skipRecording?: boolean }): Promise<void> {
+  private async runScriptStages(sessionId: string, selected: Set<StageId>): Promise<void> {
     const session = this.requireSession(sessionId);
     await mkdir(session.workDir, { recursive: true });
+    const store = this.deps.store;
 
-    // 1. Optional repo summary (clone + analyze) when a github url was supplied.
+    // 1. Optional repo summary (clone + analyze) when selected and a github url was supplied.
     let repoSummary: string | undefined;
-    if (session.input.githubUrl && this.deps.repositoryCloner && this.deps.codebaseAnalyzer && this.deps.flowExtractor) {
+    const canAnalyze =
+      selected.has('analyze') &&
+      session.input.githubUrl &&
+      this.deps.repositoryCloner &&
+      this.deps.codebaseAnalyzer &&
+      this.deps.flowExtractor;
+    if (canAnalyze) {
+      store.setStage(sessionId, 'analyze', { status: 'running' });
+      store.setStatus(sessionId, 'PLANNING');
       try {
-        this.deps.store.setStatus(sessionId, 'PLANNING');
-        const clone = await this.deps.repositoryCloner.clone({
-          githubUrl: session.input.githubUrl,
+        const clone = await this.deps.repositoryCloner!.clone({
+          githubUrl: session.input.githubUrl!,
           branch: session.input.branch,
           depth: 1,
         });
-        const analysis = await this.deps.codebaseAnalyzer.analyze(clone.localPath);
-        const flows = this.deps.flowExtractor.extract(analysis);
+        const analysis = await this.deps.codebaseAnalyzer!.analyze(clone.localPath);
+        const flows = this.deps.flowExtractor!.extract(analysis);
         repoSummary = summariseRepo(analysis, flows);
         await clone.cleanup();
+        store.setStage(sessionId, 'analyze', { status: 'done', message: summaryHeadline(analysis) });
       } catch (err) {
         console.warn(`[pipeline ${sessionId}] repo summary failed, proceeding without:`, err);
+        store.setStage(sessionId, 'analyze', { status: 'failed', message: String((err as any)?.message ?? err) });
       }
+    } else {
+      store.skipStage(sessionId, 'analyze');
     }
 
     // Stash repoSummary for later iterations without re-cloning.
-    this.deps.store.update(sessionId, (s) => {
+    store.update(sessionId, (s) => {
       (s as any)._repoSummary = repoSummary;
     });
 
     // 2. Plan
-    this.deps.store.setStatus(sessionId, 'PLANNING');
+    store.setStage(sessionId, 'plan', { status: 'running' });
+    store.setStatus(sessionId, 'PLANNING');
     const plan = await this.deps.planner.plan({
       userPrompt: session.input.userPrompt,
       repoSummary,
       defaultDurationSec: session.input.targetDurationSec,
     });
-    this.deps.store.update(sessionId, (s) => {
+    store.update(sessionId, (s) => {
       s.plan = plan;
     });
+    store.setStage(sessionId, 'plan', { status: 'done', message: plan.audience });
 
-    // 3. Research
-    this.deps.store.setStatus(sessionId, 'RESEARCHING');
-    const research = await this.deps.researcher.research({
-      userPrompt: session.input.userPrompt,
-      plan,
-    });
-    this.deps.store.update(sessionId, (s) => {
+    // 3. Research (optional)
+    let research;
+    if (selected.has('research')) {
+      store.setStage(sessionId, 'research', { status: 'running' });
+      store.setStatus(sessionId, 'RESEARCHING');
+      research = await this.deps.researcher.research({ userPrompt: session.input.userPrompt, plan });
+      store.setStage(sessionId, 'research', {
+        status: 'done',
+        message: `${research.dos.length} dos · ${research.donts.length} don'ts`,
+      });
+    } else {
+      store.skipStage(sessionId, 'research');
+      research = { summary: '', dos: [], donts: [], examplesOrPatterns: [], citations: [] };
+    }
+    store.update(sessionId, (s) => {
       s.research = research;
     });
 
     // 4. First script
+    store.setStage(sessionId, 'script', { status: 'running' });
     const draft = await this.deps.scripter.write({
       userPrompt: session.input.userPrompt,
       plan,
       research,
       repoSummary,
     });
-    this.deps.store.appendScriptVersion(sessionId, {
+    store.appendScriptVersion(sessionId, {
       fullScript: draft.fullScript,
       estimatedDurationSec: draft.estimatedDurationSec,
       wordCount: draft.wordCount,
+    });
+    store.setStage(sessionId, 'script', {
+      status: 'done',
+      message: `${draft.wordCount} words · ~${draft.estimatedDurationSec}s`,
     });
     // Status is already SCRIPT_DRAFT after appendScriptVersion.
   }
@@ -189,13 +240,15 @@ export class PipelineOrchestrator {
   ): Promise<void> {
     const session = this.requireSession(sessionId);
     const sessionDir = session.workDir;
+    const store = this.deps.store;
     await mkdir(sessionDir, { recursive: true });
 
     // 1. Audio + (optional) video in parallel.
+    store.setStage(sessionId, 'voiceover', { status: 'running' });
     const audioPromise = this.deps.audioGenerator
       .generate(approvedScript.fullScript, { outputDir: sessionDir })
       .then((res) => {
-        this.deps.store.update(sessionId, (s) => {
+        store.update(sessionId, (s) => {
           s.audio = {
             url: `${this.deps.publicMediaPrefix}/${sessionId}/${res.fileName}`,
             fileName: res.fileName,
@@ -203,51 +256,121 @@ export class PipelineOrchestrator {
             durationEstimateMs: res.durationEstimateMs,
           };
         });
+        store.setStage(sessionId, 'voiceover', { status: 'done', message: `${Math.round(res.bytes / 1024)} KB` });
         return res;
+      })
+      .catch((err) => {
+        store.setStage(sessionId, 'voiceover', { status: 'failed', message: String(err?.message ?? err) });
+        throw err;
       });
 
-    const recordingEnabled =
-      !options.skipRecording && !!session.input.githubUrl && !!this.deps.sandboxRecorder;
-
-    const videoPromise: Promise<{ filePath: string } | null> = recordingEnabled
-      ? this.deps.sandboxRecorder!
-          .recordRepository({
-            githubUrl: session.input.githubUrl!,
-            branch: session.input.branch,
-            recordDurationMs: Math.min(approvedScript.estimatedDurationSec, 120) * 1000,
-          })
-          .then((res) => {
-            this.deps.store.update(sessionId, (s) => {
-              s.video = {
-                url: `${this.deps.publicMediaPrefix}/${sessionId}/${path.basename(res.recording.localPath)}`,
-                fileName: path.basename(res.recording.localPath),
-              };
-            });
-            return { filePath: res.recording.localPath };
-          })
-          .catch((err) => {
-            console.warn(`[pipeline ${sessionId}] recording failed, falling back to slate:`, err);
-            return null;
-          })
-      : Promise.resolve(null);
+    const recordSelected = session.stages.find((s) => s.id === 'record')?.status !== 'skipped';
+    const recordDurationMs = Math.min(approvedScript.estimatedDurationSec, 120) * 1000;
+    const videoPromise = !options.skipRecording && recordSelected
+      ? this.recordTarget(sessionId, session, recordDurationMs)
+      : Promise.resolve(null).then((v) => {
+          store.skipStage(sessionId, 'record');
+          return v;
+        });
 
     const [audio, video] = await Promise.all([audioPromise, videoPromise]);
 
     // 2. Fuse
-    this.deps.store.setStatus(sessionId, 'FUSING');
+    store.setStage(sessionId, 'fuse', { status: 'running' });
+    store.setStatus(sessionId, 'FUSING');
     const fused = await this.deps.fuser.fuse({
       audioPath: audio.filePath,
       videoPath: video?.filePath,
       outputDir: sessionDir,
       slateTitle: session.plan?.audience ? `Pitchbox · ${session.plan.audience}` : 'Pitchbox demo',
     });
-    this.deps.store.update(sessionId, (s) => {
+    store.update(sessionId, (s) => {
       s.finalVideo = {
         url: `${this.deps.publicMediaPrefix}/${sessionId}/${fused.fileName}`,
         fileName: fused.fileName,
       };
       s.status = 'READY';
     });
+    store.setStage(sessionId, 'fuse', { status: 'done', message: video ? 'with screen capture' : 'slate' });
+  }
+
+  /**
+   * Record the configured target: a deployed `recordUrl` via the local URL
+   * recorder, or a GitHub repo via the Daytona sandbox recorder. Returns the
+   * captured file path, or null on failure (the pipeline falls back to a slate).
+   */
+  private async recordTarget(
+    sessionId: string,
+    session: PipelineSession,
+    recordDurationMs: number,
+  ): Promise<{ filePath: string } | null> {
+    const store = this.deps.store;
+    store.setStage(sessionId, 'record', { status: 'running' });
+    // Hard ceiling so a wedged recorder can never stall the pipeline — on
+    // timeout we abandon the capture and fall back to a slate.
+    const recordCeilingMs = Math.max(recordDurationMs, 60_000) + 60_000;
+    try {
+      if (session.input.recordUrl && this.deps.urlRecorder) {
+        const rec = await withTimeout(
+          this.deps.urlRecorder.record(session.input.recordUrl),
+          recordCeilingMs,
+          'URL recording',
+        );
+        const filePath = await this.stageRecordedFile(sessionId, session, rec.localPath);
+        store.setStage(sessionId, 'record', { status: 'done', message: session.input.recordUrl });
+        return { filePath };
+      }
+      if (session.input.githubUrl && this.deps.sandboxRecorder) {
+        const res = await withTimeout(
+          this.deps.sandboxRecorder.recordRepository({
+            githubUrl: session.input.githubUrl,
+            branch: session.input.branch,
+            recordDurationMs,
+          }),
+          recordCeilingMs,
+          'sandbox recording',
+        );
+        const filePath = await this.stageRecordedFile(sessionId, session, res.recording.localPath);
+        store.setStage(sessionId, 'record', { status: 'done', message: 'sandbox capture' });
+        return { filePath };
+      }
+      // Nothing to record against.
+      store.skipStage(sessionId, 'record');
+      return null;
+    } catch (err) {
+      console.warn(`[pipeline ${sessionId}] recording failed, falling back to slate:`, err);
+      store.setStage(sessionId, 'record', { status: 'failed', message: String((err as any)?.message ?? err) });
+      return null;
+    }
+  }
+
+  /**
+   * Copy a captured file into the session dir so it is served under
+   * `${publicMediaPrefix}/${sessionId}/...`, record it on the session, and
+   * return the in-session path (used as the fusion input).
+   */
+  private async stageRecordedFile(
+    sessionId: string,
+    session: PipelineSession,
+    localPath: string,
+  ): Promise<string> {
+    const fileName = path.basename(localPath);
+    const dest = path.join(session.workDir, fileName);
+    try {
+      if (path.resolve(localPath) !== path.resolve(dest)) {
+        await copyFile(localPath, dest);
+      }
+    } catch (err) {
+      console.warn(`[pipeline ${sessionId}] could not stage capture into session dir:`, err);
+      return localPath; // fall back to the original path for fusion
+    }
+    this.deps.store.update(sessionId, (s) => {
+      s.video = {
+        url: `${this.deps.publicMediaPrefix}/${sessionId}/${fileName}`,
+        fileName,
+      };
+    });
+    return dest;
   }
 
   private requireSession(id: string): PipelineSession {
@@ -255,6 +378,24 @@ export class PipelineOrchestrator {
     if (!s) throw new Error(`Session ${id} not found`);
     return s;
   }
+}
+
+/** Reject if `promise` does not settle within `ms`. Used to bound the recorder. */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
+    timer.unref?.();
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
 }
 
 function summariseRepo(analysis: AnalysisResult, flows: any): string {
@@ -273,4 +414,10 @@ function summariseRepo(analysis: AnalysisResult, flows: any): string {
     parts.push(`README excerpt: ${readme.content.slice(0, 600)}`);
   }
   return parts.join('\n');
+}
+
+function summaryHeadline(analysis: AnalysisResult): string {
+  const fw = analysis.techStack.frameworks.slice(0, 2).join(', ');
+  const lang = analysis.techStack.languages.slice(0, 2).join(', ');
+  return [fw, lang].filter(Boolean).join(' · ') || `${analysis.totalFiles} files`;
 }

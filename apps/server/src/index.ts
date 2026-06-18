@@ -25,6 +25,7 @@ import { Scripter } from './Scripter';
 import { Fuser } from './Fuser';
 import { SessionStore } from './SessionStore';
 import { PipelineOrchestrator } from './PipelineOrchestrator';
+import { STAGE_DEFS, type StageId } from './pipelineStages';
 
 const app: Express = express();
 const PORT = process.env.PORT || 3001;
@@ -59,6 +60,8 @@ const orchestrator = scriptGenerator && process.env.ANTHROPIC_API_KEY && audioGe
       repositoryCloner,
       codebaseAnalyzer,
       flowExtractor,
+      // Records a deployed/public URL directly (no Daytona required).
+      urlRecorder: recorder,
       // sandboxRecorder is wired lazily via getSandboxRecorder() to avoid
       // requiring DAYTONA_API_KEY at boot. We pass undefined here and the
       // orchestrator will fall back to the slate path when undefined.
@@ -496,13 +499,16 @@ app.post('/api/pipeline/start', (req: Request, res: Response) => {
     });
     return;
   }
-  const { githubUrl, branch, userPrompt, targetDurationSec, skipRecording } = (req.body ?? {}) as {
-    githubUrl?: string;
-    branch?: string;
-    userPrompt?: string;
-    targetDurationSec?: number;
-    skipRecording?: boolean;
-  };
+  const { githubUrl, branch, recordUrl, userPrompt, targetDurationSec, selectedStages, skipRecording } =
+    (req.body ?? {}) as {
+      githubUrl?: string;
+      branch?: string;
+      recordUrl?: string;
+      userPrompt?: string;
+      targetDurationSec?: number;
+      selectedStages?: string[];
+      skipRecording?: boolean;
+    };
 
   if (!userPrompt || typeof userPrompt !== 'string' || !userPrompt.trim()) {
     res.status(400).json({ error: 'A `userPrompt` field is required.' });
@@ -512,12 +518,18 @@ app.post('/api/pipeline/start', (req: Request, res: Response) => {
   const session = orchestrator.start({
     githubUrl: typeof githubUrl === 'string' && githubUrl.trim() ? githubUrl.trim() : undefined,
     branch: typeof branch === 'string' && branch.trim() ? branch.trim() : undefined,
+    recordUrl: typeof recordUrl === 'string' && recordUrl.trim() ? recordUrl.trim() : undefined,
     userPrompt: userPrompt.trim(),
     targetDurationSec:
       typeof targetDurationSec === 'number' && Number.isFinite(targetDurationSec) ? targetDurationSec : undefined,
+    selectedStages: Array.isArray(selectedStages) ? (selectedStages as StageId[]) : undefined,
     skipRecording: skipRecording === true,
   });
   res.status(202).json({ sessionId: session.id, status: session.status });
+});
+
+app.get('/api/pipeline/stages', (_req: Request, res: Response) => {
+  res.json({ stages: STAGE_DEFS });
 });
 
 app.get('/api/pipeline/:id/status', (req: Request, res: Response) => {

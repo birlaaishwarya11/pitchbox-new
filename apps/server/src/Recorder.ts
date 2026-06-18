@@ -298,6 +298,7 @@ export class Recorder {
     let ffmpegProcess: ChildProcessWithoutNullStreams | undefined;
     let browser: Browser | undefined;
     let capturing = false;
+    let watchdog: NodeJS.Timeout | undefined;
 
     try {
       ffmpegProcess = this.spawnFfmpegImagePipe(tmpOutput);
@@ -316,6 +317,18 @@ export class Recorder {
 
       capturing = true;
       const frameIntervalMs = Math.max(1, Math.floor(1000 / this.ffmpeg.frameRate));
+
+      // Hard cap on the whole capture. A busy SPA renderer can make a single
+      // page.screenshot() block with no timeout, which would stall the loop
+      // forever; the watchdog stops capturing and force-closes the browser so
+      // any pending screenshot rejects and the loop unwinds to finalize the mp4.
+      const hardCapMs = this.scroll.maxScrollMs + this.scroll.tailWaitMs + 10_000;
+      const capturingBrowser = browser;
+      watchdog = setTimeout(() => {
+        capturing = false;
+        capturingBrowser.close().catch(() => undefined);
+      }, hardCapMs);
+      watchdog.unref?.();
 
       // Fire-and-forget scroll — it drives page motion while frames are captured.
       const scrollPromise = this.scrollToBottom(page).catch(() => undefined);
@@ -354,15 +367,19 @@ export class Recorder {
       }
 
       capturing = false;
+      if (watchdog) clearTimeout(watchdog);
       ffmpegStdin.end();
 
-      await browser.close();
+      // The watchdog may have already closed the browser; close() is safe to
+      // call again but can reject, so swallow it.
+      await browser.close().catch(() => undefined);
       browser = undefined;
 
       await this.waitForClose(ffmpegProcess);
       ffmpegProcess = undefined;
     } finally {
       capturing = false;
+      if (watchdog) clearTimeout(watchdog);
       if (ffmpegProcess) {
         ffmpegProcess.kill('SIGKILL');
       }
@@ -571,10 +588,20 @@ export class Recorder {
   }
 
   private async waitForClose(process: ChildProcessWithoutNullStreams): Promise<void> {
+    // If ffmpeg has already exited, the 'close' event has fired and will not
+    // fire again — attaching a listener now would hang forever. Resolve based
+    // on the recorded exit state instead.
+    if (process.exitCode !== null || process.signalCode !== null) {
+      if (process.exitCode === 0) return;
+      throw new RecorderError('FFMPEG_FAILED', `ffmpeg exited with code ${process.exitCode ?? process.signalCode}.`);
+    }
+
     await new Promise<void>((resolve, reject) => {
-      // After stdin.end(), ffmpeg flushes and exits on its own.
+      // After stdin.end(), ffmpeg flushes and exits on its own. If it does not,
+      // SIGKILL it and resolve anyway — a partial mp4 is better than a hang.
       const timeout = setTimeout(() => {
         process.kill('SIGKILL');
+        resolve();
       }, 30_000);
 
       process.once('close', (code) => {
@@ -644,14 +671,19 @@ export class Recorder {
 
   private async preparePage(page: Page, url: string): Promise<void> {
     try {
+      // Wait only for DOM content — SPAs with persistent connections (websockets,
+      // analytics, realtime) may never reach full network idle, which would hang
+      // navigation. We then make a *bounded* best-effort wait for the network to
+      // settle so the first frames aren't blank, but never fail on it.
       await page.goto(url, {
-        waitUntil: 'networkidle2',
+        waitUntil: 'domcontentloaded',
         timeout: this.navigationTimeoutMs,
       });
-      await this.delay(this.scroll.preScrollWaitMs);
     } catch (error) {
       throw new RecorderError('NAVIGATION_FAILED', `Unable to navigate to ${url}`, { cause: error });
     }
+    await page.waitForNetworkIdle({ idleTime: 500, timeout: 8_000 }).catch(() => undefined);
+    await this.delay(this.scroll.preScrollWaitMs);
   }
 
   private async scrollToBottom(page: Page): Promise<void> {
