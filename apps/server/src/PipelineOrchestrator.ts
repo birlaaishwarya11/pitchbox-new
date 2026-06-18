@@ -1,9 +1,10 @@
 import path from 'node:path';
 import { mkdir, copyFile } from 'node:fs/promises';
 import type { SessionStore, PipelineSession, ScriptVersion } from './SessionStore';
-import type { Planner } from './Planner';
-import type { Researcher } from './Researcher';
-import type { Scripter } from './Scripter';
+import { Planner } from './Planner';
+import { Researcher } from './Researcher';
+import { Scripter } from './Scripter';
+import { createLlmClient, type LlmConfig } from './llm/createLlmClient';
 import type { AudioGenerator } from './AudioGenerator';
 import type { Fuser } from './Fuser';
 import type { RepositoryCloner } from './RepositoryCloner';
@@ -14,11 +15,16 @@ import type { Recorder } from './Recorder';
 import type { SlateRenderer } from './SlateRenderer';
 import { resolveSelectedStages, type StageId } from './pipelineStages';
 
-export interface PipelineDeps {
-  store: SessionStore;
+interface SessionAgents {
   planner: Planner;
   researcher: Researcher;
   scripter: Scripter;
+}
+
+export interface PipelineDeps {
+  store: SessionStore;
+  // Operator fallback LLM config (from server env) when a request brings no key.
+  defaultLlm?: LlmConfig;
   audioGenerator: AudioGenerator;
   fuser: Fuser;
   repositoryCloner?: RepositoryCloner;
@@ -47,14 +53,36 @@ export interface StartInput {
   selectedStages?: StageId[];
   // If true, skip the screen-recording leg even if a target is available.
   skipRecording?: boolean;
+  // Bring-your-own LLM: provider + key + model. Falls back to the operator's
+  // default config when omitted.
+  llm?: LlmConfig;
 }
 
 export class PipelineOrchestrator {
+  // Per-session LLM agents, built from the run's chosen provider/key/model.
+  private readonly agentsBySession = new Map<string, SessionAgents>();
+
   constructor(private readonly deps: PipelineDeps) {}
+
+  private buildAgents(llm: LlmConfig): SessionAgents {
+    const client = createLlmClient(llm);
+    return {
+      planner: new Planner(client),
+      researcher: new Researcher(client),
+      scripter: new Scripter(client),
+    };
+  }
 
   /** Creates a session and kicks off plan + research + first script in the background. */
   start(input: StartInput): PipelineSession {
     const selected = resolveSelectedStages(input.selectedStages);
+    const llm = input.llm ?? this.deps.defaultLlm;
+    if (!llm) {
+      throw new Error('No LLM configured. Provide an API key (provider + model), or set a server default.');
+    }
+    // Build eagerly so an invalid provider/model fails fast with a clear error.
+    const agents = this.buildAgents(llm);
+
     const session = this.deps.store.create(
       {
         githubUrl: input.githubUrl,
@@ -65,8 +93,9 @@ export class PipelineOrchestrator {
       },
       selected,
     );
+    this.agentsBySession.set(session.id, agents);
 
-    void this.runScriptStages(session.id, selected).catch((err) => {
+    void this.runScriptStages(session.id, selected, agents).catch((err) => {
       console.error(`[pipeline ${session.id}] script-stage failure:`, err);
       this.deps.store.setError(session.id, this.deps.store.get(session.id)?.status ?? 'PLANNING', String(err?.message ?? err));
     });
@@ -82,8 +111,12 @@ export class PipelineOrchestrator {
     }
     const previous = session.scriptVersions[session.scriptVersions.length - 1];
     const repoSummary = (session as any)._repoSummary as string | undefined;
+    const agents = this.agentsBySession.get(sessionId);
+    if (!agents) {
+      throw new Error('This session has expired (server restarted). Start a new one.');
+    }
 
-    const result = await this.deps.scripter.write({
+    const result = await agents.scripter.write({
       userPrompt: session.input.userPrompt,
       plan: session.plan,
       research: session.research,
@@ -145,7 +178,7 @@ export class PipelineOrchestrator {
   // Internals
   // ---------------------------------------------------------------------------
 
-  private async runScriptStages(sessionId: string, selected: Set<StageId>): Promise<void> {
+  private async runScriptStages(sessionId: string, selected: Set<StageId>, agents: SessionAgents): Promise<void> {
     const session = this.requireSession(sessionId);
     await mkdir(session.workDir, { recursive: true });
     const store = this.deps.store;
@@ -188,7 +221,7 @@ export class PipelineOrchestrator {
     // 2. Plan
     store.setStage(sessionId, 'plan', { status: 'running' });
     store.setStatus(sessionId, 'PLANNING');
-    const plan = await this.deps.planner.plan({
+    const plan = await agents.planner.plan({
       userPrompt: session.input.userPrompt,
       repoSummary,
       defaultDurationSec: session.input.targetDurationSec,
@@ -203,7 +236,7 @@ export class PipelineOrchestrator {
     if (selected.has('research')) {
       store.setStage(sessionId, 'research', { status: 'running' });
       store.setStatus(sessionId, 'RESEARCHING');
-      research = await this.deps.researcher.research({ userPrompt: session.input.userPrompt, plan });
+      research = await agents.researcher.research({ userPrompt: session.input.userPrompt, plan });
       store.setStage(sessionId, 'research', {
         status: 'done',
         message: `${research.dos.length} dos · ${research.donts.length} don'ts`,
@@ -218,7 +251,7 @@ export class PipelineOrchestrator {
 
     // 4. First script
     store.setStage(sessionId, 'script', { status: 'running' });
-    const draft = await this.deps.scripter.write({
+    const draft = await agents.scripter.write({
       userPrompt: session.input.userPrompt,
       plan,
       research,

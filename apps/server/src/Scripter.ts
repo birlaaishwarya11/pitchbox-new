@@ -1,5 +1,5 @@
-import Anthropic from '@anthropic-ai/sdk';
 import type { PlanArtifact, ResearchArtifact, ScriptVersion } from './SessionStore';
+import type { LlmClient } from './llm/LlmClient';
 
 export interface ScripterInput {
   userPrompt: string;
@@ -23,31 +23,18 @@ export class ScripterError extends Error {
   }
 }
 
-const MODEL = 'claude-opus-4-8';
-
 export class Scripter {
-  private readonly client: Anthropic;
-
-  constructor(apiKey: string) {
-    if (!apiKey) throw new ScripterError('Anthropic API key required');
-    this.client = new Anthropic({ apiKey });
-  }
+  constructor(private readonly client: LlmClient) {}
 
   async write(input: ScripterInput): Promise<ScripterResult> {
     try {
-      const response = await this.client.messages.create({
-        model: MODEL,
-        max_tokens: 2048,
+      const text = await this.client.chat({
         system: SYSTEM,
-        messages: [{ role: 'user', content: buildUserMessage(input) }],
+        maxTokens: 2048,
+        user: buildUserMessage(input),
       });
 
-      const block = response.content[0];
-      if (!block || block.type !== 'text') {
-        throw new ScripterError('Unexpected response format from Claude');
-      }
-
-      const script = block.text.trim();
+      const script = text.trim();
       const wordCount = script.split(/\s+/).filter(Boolean).length;
       return {
         fullScript: script,

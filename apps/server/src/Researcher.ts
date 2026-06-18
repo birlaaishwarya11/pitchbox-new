@@ -1,5 +1,6 @@
-import Anthropic from '@anthropic-ai/sdk';
 import type { PlanArtifact, ResearchArtifact } from './SessionStore';
+import type { LlmClient } from './llm/LlmClient';
+import { parseJsonObject } from './llm/jsonParse';
 
 export interface ResearcherInput {
   userPrompt: string;
@@ -13,66 +14,19 @@ export class ResearcherError extends Error {
   }
 }
 
-const MODEL = 'claude-opus-4-8';
-const MAX_TOKENS = 2500;
-
-// Structured-output tool. Forcing the model to answer via this tool means the
-// SDK returns a parsed object — no brittle JSON-from-text parsing, and no
-// truncation-induced parse failures.
-const RESEARCH_TOOL: Anthropic.Tool = {
-  name: 'submit_research',
-  description: 'Submit the demo-video research findings as structured data.',
-  input_schema: {
-    type: 'object',
-    properties: {
-      summary: { type: 'string', description: '2-4 sentence summary of the winning approach for this use case.' },
-      dos: { type: 'array', items: { type: 'string' }, description: 'Up to 6 concrete dos.' },
-      donts: { type: 'array', items: { type: 'string' }, description: 'Up to 6 concrete donts.' },
-      examplesOrPatterns: { type: 'array', items: { type: 'string' }, description: 'Up to 5 patterns or examples.' },
-      citations: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: { title: { type: 'string' }, url: { type: 'string' } },
-          required: ['url'],
-        },
-        description: 'Optional sources; may be empty.',
-      },
-    },
-    required: ['summary', 'dos', 'donts', 'examplesOrPatterns', 'citations'],
-  },
-};
-
-const SYSTEM = `You are a research agent for demo-video scripts. Use your knowledge of demo-video best practices for hackathons, marketing landing pages, LinkedIn launches, YouTube, and Twitter/X.
-
-Give concrete, actionable guidance specific to the user's use case (audience + goal + tone), not generic video advice. Keep each list to at most 6 short items. Submit your findings by calling the submit_research tool.`;
-
 export class Researcher {
-  private readonly client: Anthropic;
-
-  constructor(apiKey: string) {
-    if (!apiKey) throw new ResearcherError('Anthropic API key required');
-    this.client = new Anthropic({ apiKey });
-  }
+  constructor(private readonly client: LlmClient) {}
 
   async research(input: ResearcherInput): Promise<ResearchArtifact> {
     try {
-      const response = await this.client.messages.create({
-        model: MODEL,
-        max_tokens: MAX_TOKENS,
+      const text = await this.client.chat({
         system: SYSTEM,
-        tools: [RESEARCH_TOOL],
-        tool_choice: { type: 'tool', name: RESEARCH_TOOL.name },
-        messages: [{ role: 'user', content: buildUserMessage(input) }],
+        maxTokens: 1500,
+        user: buildUserMessage(input),
       });
-
-      const toolUse = response.content.find(
-        (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use' && b.name === RESEARCH_TOOL.name,
-      );
-      if (!toolUse) {
-        throw new ResearcherError('Researcher did not return structured output');
-      }
-      return normalizeResearch(toolUse.input as Record<string, unknown>);
+      const json = parseJsonObject(text);
+      if (!json) throw new ResearcherError(`Researcher returned non-JSON: ${text.slice(0, 200)}`);
+      return normalizeResearch(json);
     } catch (error) {
       if (error instanceof ResearcherError) throw error;
       throw new ResearcherError(
@@ -83,15 +37,29 @@ export class Researcher {
   }
 }
 
-function normalizeResearch(input: Record<string, unknown>): ResearchArtifact {
-  const arr = (v: unknown): string[] => (Array.isArray(v) ? v.map((x) => String(x)) : []);
+const SYSTEM = `You are a research agent for demo-video scripts. Use your knowledge of demo-video best practices for hackathons, marketing landing pages, LinkedIn launches, YouTube, and Twitter/X.
+
+Give concrete, actionable guidance specific to the user's use case (audience + goal + tone), not generic video advice. Keep each list to at most 6 short items.
+
+Output strictly this JSON shape, no prose, no markdown fences. Citations may be empty:
+{
+  "summary": string,
+  "dos": string[],
+  "donts": string[],
+  "examplesOrPatterns": string[],
+  "citations": [{ "title": string, "url": string }]
+}`;
+
+function normalizeResearch(input: any): ResearchArtifact {
+  const v = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
+  const arr = (k: string): string[] => (Array.isArray(v[k]) ? (v[k] as unknown[]).map(String) : []);
   return {
-    summary: typeof input.summary === 'string' ? input.summary : '',
-    dos: arr(input.dos),
-    donts: arr(input.donts),
-    examplesOrPatterns: arr(input.examplesOrPatterns),
-    citations: Array.isArray(input.citations)
-      ? (input.citations as any[])
+    summary: typeof v.summary === 'string' ? v.summary : '',
+    dos: arr('dos'),
+    donts: arr('donts'),
+    examplesOrPatterns: arr('examplesOrPatterns'),
+    citations: Array.isArray(v.citations)
+      ? (v.citations as any[])
           .filter((c) => c && typeof c.url === 'string')
           .map((c) => ({ title: String(c.title ?? ''), url: String(c.url) }))
       : [],

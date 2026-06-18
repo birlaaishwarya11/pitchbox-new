@@ -1,5 +1,6 @@
-import Anthropic from '@anthropic-ai/sdk';
 import type { PlanArtifact } from './SessionStore';
+import type { LlmClient } from './llm/LlmClient';
+import { parseJsonObject } from './llm/jsonParse';
 
 export interface PlannerInput {
   userPrompt: string;
@@ -14,50 +15,32 @@ export class PlannerError extends Error {
   }
 }
 
-const MODEL = 'claude-opus-4-8';
-
 export class Planner {
-  private readonly client: Anthropic;
-
-  constructor(apiKey: string) {
-    if (!apiKey) throw new PlannerError('Anthropic API key required');
-    this.client = new Anthropic({ apiKey });
-  }
+  constructor(private readonly client: LlmClient) {}
 
   async plan(input: PlannerInput): Promise<PlanArtifact> {
     const defaultDuration = input.defaultDurationSec ?? 90;
-
     try {
-      const response = await this.client.messages.create({
-        model: MODEL,
-        max_tokens: 1024,
+      const text = await this.client.chat({
         system: SYSTEM,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              `# User purpose / instructions`,
-              input.userPrompt.trim(),
-              ``,
-              input.repoSummary ? `# Repository summary\n${input.repoSummary.trim()}\n` : '',
-              `# Default duration if user didn't specify`,
-              `${defaultDuration} seconds`,
-              ``,
-              `Output JSON only, matching the schema in the system prompt.`,
-            ]
-              .filter(Boolean)
-              .join('\n'),
-          },
-        ],
+        maxTokens: 1024,
+        user: [
+          `# User purpose / instructions`,
+          input.userPrompt.trim(),
+          ``,
+          input.repoSummary ? `# Repository summary\n${input.repoSummary.trim()}\n` : '',
+          `# Default duration if user didn't specify`,
+          `${defaultDuration} seconds`,
+          ``,
+          `Output JSON only, matching the schema in the system prompt.`,
+        ]
+          .filter(Boolean)
+          .join('\n'),
       });
 
-      const block = response.content[0];
-      if (!block || block.type !== 'text') {
-        throw new PlannerError('Unexpected response format from Claude');
-      }
-
-      const json = extractJson(block.text);
-      return validatePlan(json);
+      const json = parseJsonObject(text);
+      if (!json) throw new PlannerError(`Planner returned non-JSON: ${text.slice(0, 200)}`);
+      return coercePlan(json, defaultDuration);
     } catch (error) {
       if (error instanceof PlannerError) throw error;
       throw new PlannerError(
@@ -92,45 +75,24 @@ Output strictly this JSON shape, no prose, no markdown fences:
   "notes": string
 }`;
 
-function extractJson(text: string): unknown {
-  const trimmed = text.trim();
-  // Strip ```json fences if the model adds them despite instructions.
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = fenced ? fenced[1].trim() : trimmed;
-  try {
-    return JSON.parse(candidate);
-  } catch (e) {
-    throw new PlannerError(`Planner returned non-JSON: ${candidate.slice(0, 200)}`);
-  }
-}
-
-function validatePlan(value: unknown): PlanArtifact {
-  if (!value || typeof value !== 'object') throw new PlannerError('Plan must be an object');
-  const v = value as Record<string, unknown>;
-  const must = (k: string, t: 'string' | 'number') => {
-    if (typeof v[k] !== t) throw new PlannerError(`Plan field ${k} must be ${t}`);
-  };
-  const arr = (k: string) => {
-    if (!Array.isArray(v[k])) throw new PlannerError(`Plan field ${k} must be array`);
-  };
-  must('audience', 'string');
-  must('primaryGoal', 'string');
-  must('toneAndStyle', 'string');
-  must('targetDurationSec', 'number');
-  arr('mustCover');
-  arr('avoid');
-  must('openingHook', 'string');
-  must('closingMove', 'string');
-  must('notes', 'string');
+// Lenient coercion (rather than strict reject) so weaker / non-Anthropic models
+// that omit a field still produce a usable plan.
+function coercePlan(value: any, defaultDuration: number): PlanArtifact {
+  const v = (value && typeof value === 'object' ? value : {}) as Record<string, unknown>;
+  const str = (k: string, fallback = '') => (typeof v[k] === 'string' ? (v[k] as string) : fallback);
+  const arr = (k: string) => (Array.isArray(v[k]) ? (v[k] as unknown[]).map(String) : []);
+  const dur = typeof v.targetDurationSec === 'number' && Number.isFinite(v.targetDurationSec)
+    ? (v.targetDurationSec as number)
+    : defaultDuration;
   return {
-    audience: v.audience as string,
-    primaryGoal: v.primaryGoal as string,
-    toneAndStyle: v.toneAndStyle as string,
-    targetDurationSec: v.targetDurationSec as number,
-    mustCover: (v.mustCover as unknown[]).map(String),
-    avoid: (v.avoid as unknown[]).map(String),
-    openingHook: v.openingHook as string,
-    closingMove: v.closingMove as string,
-    notes: v.notes as string,
+    audience: str('audience', 'General audience'),
+    primaryGoal: str('primaryGoal', 'Explain what this does and why it matters'),
+    toneAndStyle: str('toneAndStyle', 'Clear and confident'),
+    targetDurationSec: dur,
+    mustCover: arr('mustCover'),
+    avoid: arr('avoid'),
+    openingHook: str('openingHook'),
+    closingMove: str('closingMove'),
+    notes: str('notes'),
   };
 }

@@ -6,6 +6,15 @@ const SERVER_BASE = process.env.NEXT_PUBLIC_SERVER_BASE || 'http://localhost:300
 
 type Status = 'CREATED' | 'PLANNING' | 'RESEARCHING' | 'SCRIPT_DRAFT' | 'GENERATING' | 'FUSING' | 'READY' | 'ERROR';
 
+type LlmCfg = { provider: string; apiKey: string; model: string };
+type ProviderInfo = {
+  id: string;
+  label: string;
+  free: boolean;
+  keysUrl: string;
+  models: { id: string; label: string; free?: boolean }[];
+};
+
 type StageId = 'analyze' | 'plan' | 'research' | 'script' | 'record' | 'voiceover' | 'fuse';
 type StageStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 type StageState = {
@@ -106,6 +115,9 @@ export default function PipelinePage() {
     return [...ids, ...selectedOptional];
   };
 
+  // Bring-your-own LLM config (null = use the server default, if any).
+  const [llm, setLlm] = useState<LlmCfg | null>(null);
+
   // Feedback box
   const [feedback, setFeedback] = useState('');
   const [iterating, setIterating] = useState(false);
@@ -157,6 +169,7 @@ export default function PipelinePage() {
           targetDurationSec,
           selectedStages: selectedStageIds(),
           skipRecording: !recordSelected,
+          llm: llm ?? undefined,
         }),
       });
       const data = await r.json();
@@ -257,6 +270,7 @@ export default function PipelinePage() {
             setTargetDurationSec={setTargetDurationSec}
             selectedOptional={selectedOptional}
             toggleOptional={toggleOptional}
+            onLlmChange={setLlm}
             onStart={handleStart}
           />
         )}
@@ -330,6 +344,7 @@ function InputCard(props: {
   setTargetDurationSec: (v: number) => void;
   selectedOptional: Set<StageId>;
   toggleOptional: (id: StageId) => void;
+  onLlmChange: (llm: LlmCfg | null) => void;
   onStart: () => void;
 }) {
   const analyzeOn = props.selectedOptional.has('analyze');
@@ -395,6 +410,9 @@ function InputCard(props: {
         />
       </div>
 
+      {/* Model provider (bring your own key). */}
+      <ProviderConfig onChange={props.onLlmChange} />
+
       {/* Stage-selection panel: pick which agents run before launch. */}
       <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3 space-y-2">
         <p className="text-xs uppercase tracking-widest text-zinc-500">Stages to run</p>
@@ -439,6 +457,164 @@ function InputCard(props: {
         </button>
       </div>
     </section>
+  );
+}
+
+const CUSTOM_MODEL = '__custom__';
+
+function ProviderConfig({ onChange }: { onChange: (llm: LlmCfg | null) => void }) {
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [hasServerDefault, setHasServerDefault] = useState(false);
+  const [providerId, setProviderId] = useState('anthropic');
+  const [modelChoice, setModelChoice] = useState('');
+  const [customModel, setCustomModel] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [showKey, setShowKey] = useState(false);
+  const [test, setTest] = useState<{ state: 'idle' | 'testing' | 'ok' | 'fail'; message?: string }>({ state: 'idle' });
+
+  const provider = providers.find((p) => p.id === providerId);
+  const model = modelChoice === CUSTOM_MODEL ? customModel.trim() : modelChoice;
+
+  useEffect(() => {
+    fetch(`${SERVER_BASE}/api/providers`)
+      .then((r) => r.json())
+      .then((d) => {
+        setProviders(d.providers ?? []);
+        setHasServerDefault(!!d.hasServerDefault);
+        const first = (d.providers ?? [])[0];
+        if (first) {
+          setProviderId(first.id);
+          setModelChoice(first.models[0]?.id ?? CUSTOM_MODEL);
+        }
+      })
+      .catch(() => undefined);
+  }, []);
+
+  // Report the resolved config up: a complete BYO config, or null (server default).
+  useEffect(() => {
+    if (apiKey.trim() && model && providerId) {
+      onChange({ provider: providerId, apiKey: apiKey.trim(), model });
+    } else {
+      onChange(null);
+    }
+    setTest({ state: 'idle' });
+  }, [providerId, model, apiKey]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const onPickProvider = (id: string) => {
+    setProviderId(id);
+    const p = providers.find((x) => x.id === id);
+    setModelChoice(p?.models[0]?.id ?? CUSTOM_MODEL);
+    setCustomModel('');
+  };
+
+  const runTest = async () => {
+    if (!apiKey.trim() || !model) return;
+    setTest({ state: 'testing' });
+    try {
+      const r = await fetch(`${SERVER_BASE}/api/validate-key`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ provider: providerId, apiKey: apiKey.trim(), model }),
+      });
+      const d = await r.json();
+      setTest(d.ok ? { state: 'ok' } : { state: 'fail', message: d.message || 'Validation failed' });
+    } catch (e) {
+      setTest({ state: 'fail', message: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
+  return (
+    <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3 space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="text-xs uppercase tracking-widest text-zinc-500">Model provider</p>
+        {hasServerDefault && (
+          <span className="text-[10px] text-zinc-500">leave key blank to use the server default</span>
+        )}
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div className="space-y-1.5">
+          <label className="text-xs text-zinc-400">Provider</label>
+          <select
+            value={providerId}
+            onChange={(e) => onPickProvider(e.target.value)}
+            className="w-full rounded bg-zinc-950 border border-zinc-800 p-1.5 text-sm"
+          >
+            {providers.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.label}
+                {p.free ? ' — free' : ''}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="space-y-1.5">
+          <label className="text-xs text-zinc-400">Model</label>
+          <select
+            value={modelChoice}
+            onChange={(e) => setModelChoice(e.target.value)}
+            className="w-full rounded bg-zinc-950 border border-zinc-800 p-1.5 text-sm"
+          >
+            {(provider?.models ?? []).map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+                {m.free ? ' (free)' : ''}
+              </option>
+            ))}
+            <option value={CUSTOM_MODEL}>Other (enter exact model name)…</option>
+          </select>
+        </div>
+      </div>
+
+      {modelChoice === CUSTOM_MODEL && (
+        <input
+          value={customModel}
+          onChange={(e) => setCustomModel(e.target.value)}
+          placeholder="exact-model-name (must match the provider's API)"
+          className="w-full rounded bg-zinc-950 border border-zinc-800 p-1.5 text-sm font-mono"
+        />
+      )}
+
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between">
+          <label className="text-xs text-zinc-400">API key</label>
+          {provider && (
+            <a href={provider.keysUrl} target="_blank" rel="noreferrer" className="text-[10px] text-indigo-400 underline">
+              get a key ↗
+            </a>
+          )}
+        </div>
+        <div className="flex gap-2">
+          <input
+            type={showKey ? 'text' : 'password'}
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder={hasServerDefault ? 'optional — uses server default if blank' : 'paste your API key'}
+            className="flex-1 rounded bg-zinc-950 border border-zinc-800 p-1.5 text-sm font-mono"
+          />
+          <button
+            type="button"
+            onClick={() => setShowKey((s) => !s)}
+            className="rounded border border-zinc-800 text-zinc-400 text-xs px-2 hover:text-zinc-200"
+          >
+            {showKey ? 'hide' : 'show'}
+          </button>
+          <button
+            type="button"
+            onClick={runTest}
+            disabled={!apiKey.trim() || !model || test.state === 'testing'}
+            className="rounded border border-zinc-700 text-zinc-200 text-xs px-3 hover:border-zinc-500 disabled:opacity-40"
+          >
+            {test.state === 'testing' ? 'Testing…' : 'Test key'}
+          </button>
+        </div>
+        {test.state === 'ok' && <p className="text-[11px] text-emerald-400">✓ Key and model are valid.</p>}
+        {test.state === 'fail' && <p className="text-[11px] text-rose-400">✗ {test.message}</p>}
+        {!apiKey.trim() && !hasServerDefault && (
+          <p className="text-[11px] text-amber-400">No server default — a key is required to run.</p>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -567,7 +743,7 @@ function ResearchView({ research }: { research: NonNullable<Session['research']>
         <p><b className="text-emerald-300">DO:</b> {research.dos.join(' · ')}</p>
       )}
       {research.donts.length > 0 && (
-        <p><b className="text-rose-300">DON'T:</b> {research.donts.join(' · ')}</p>
+        <p><b className="text-rose-300">DON&apos;T:</b> {research.donts.join(' · ')}</p>
       )}
       {research.citations.length > 0 && (
         <p>
@@ -625,7 +801,7 @@ function ScriptReviewCard(props: {
               <div key={v.id} className="rounded border border-zinc-800 p-2">
                 <div className="text-[10px] text-zinc-500 mb-1">
                   v{v.versionNumber} · {v.wordCount} words
-                  {v.feedbackUsed && <> · feedback: "{v.feedbackUsed}"</>}
+                  {v.feedbackUsed && <> · feedback: &quot;{v.feedbackUsed}&quot;</>}
                 </div>
                 <pre className="text-[11px] whitespace-pre-wrap font-sans">{v.fullScript}</pre>
               </div>

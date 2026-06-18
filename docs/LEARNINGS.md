@@ -80,3 +80,64 @@ wall**. So you can capture the marketing pages for free; capturing the real app
 needs test credentials.
 **Lesson:** before building a deploy step, probe the existing URL — reachable?
 behind a wall? That decides whether you record directly or have to deploy.
+
+---
+# Phase 1 + 2 (landing, dead-code retirement, multi-provider BYO)
+
+## 11. Map shared-vs-dead before deleting
+**Assumed:** the old "analyze" flow's helpers were all dead.
+**Reality:** `DaytonaDeployer` looked dead but was **shared** with the live
+`/api/record` path — deleting it would have broken recording.
+**Lesson:** before a cleanup, trace every reference (a quick search pass) and
+split into *safe-to-delete* vs *shared-keep*. Deletion is the easy part;
+knowing the blast radius is the work.
+
+## 12. Next.js caches generated route types in `.next`
+**Symptom:** after deleting an API route, `tsc` failed pointing at a
+`.next/types/.../route.ts` for the file I'd just removed.
+**Lesson:** that error is a stale build artifact — `rm -rf .next` and re-check.
+Don't chase a "missing module" that you deleted on purpose.
+
+## 13. `drawtext` needs libfreetype — not in every ffmpeg
+**Assumed:** ffmpeg's `drawtext` would render the slate title.
+**Reality:** this ffmpeg build was compiled without libfreetype, so `drawtext`
+silently failed and the slate fell back to a **black frame**.
+**Lesson:** don't depend on optional ffmpeg features. We already ship headless
+Chromium for recording — render the title card as HTML, screenshot it to PNG,
+and loop that. Reuse the capability you already have.
+
+## 14. One adapter covers many LLM providers
+**Insight:** most providers (OpenAI, Google Gemini, Groq, Mistral, OpenRouter,
+DeepSeek) speak the **OpenAI-compatible** `chat/completions` API. A single
+adapter parameterized by base-URL handles all of them; only Anthropic needs its
+own. ~2 adapters → 6+ providers.
+**Lesson:** look for the common protocol before writing one client per vendor.
+
+## 15. Cross-provider structured output = JSON-in-text, not tool-calling
+**Assumed:** use the provider's structured/tool-call feature for JSON.
+**Reality:** every provider does tool-calling differently; it doesn't port.
+**Lesson:** for multi-provider, ask for plain JSON and parse it **robustly**
+(strip prose/fences, repair raw control chars). One code path, every provider.
+
+## 16. Don't commit keys — even in `.env.example`
+**Found:** a real Daytona key was sitting in the tracked `apps/server/.env.example`.
+`.gitignore` protected `.env`, but the *example* file shipped a live secret.
+**Lesson:** example files must contain blank placeholders only. Scan tracked
+files for key patterns (`sk-`, `dtn_`, …), and rotate anything that leaked —
+even into local history.
+
+## 17. The production build catches what `tsc` doesn't
+**Reality:** `tsc --noEmit` passed, but `next build` **failed** on ESLint
+(`react/no-unescaped-entities` — a literal `'`/`"` in JSX). Vercel runs the real
+build, so it would have failed there too.
+**Lesson:** run the actual production build before calling something
+deploy-ready — type-check is necessary, not sufficient.
+
+## 18. BYO keys → build clients per-request, not at boot
+**Reality:** the pipeline originally built its LLM agents once at startup from a
+server env key. Bring-your-own-key means constructing them **per session** from
+the request's provider/key/model, kept in a `Map` keyed by session id.
+**Lesson:** also handle "session expired after a restart" (the map is in
+memory) with a clear error instead of a crash. And validate a key/model with a
+tiny live call, mapping `401→invalid key`, `404→model not found`,
+`429→rate limited` to human text.

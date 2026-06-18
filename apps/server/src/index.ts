@@ -17,14 +17,13 @@ import { RepositoryCloner, RepositoryClonerError } from './RepositoryCloner';
 import { CodebaseAnalyzer } from './CodebaseAnalyzer';
 import { FlowExtractor } from './FlowExtractor';
 import { AudioGenerator, AudioGeneratorError } from './AudioGenerator';
-import { Planner } from './Planner';
-import { Researcher } from './Researcher';
-import { Scripter } from './Scripter';
 import { Fuser } from './Fuser';
 import { SlateRenderer } from './SlateRenderer';
 import { SessionStore } from './SessionStore';
 import { PipelineOrchestrator } from './PipelineOrchestrator';
 import { STAGE_DEFS, type StageId } from './pipelineStages';
+import { PROVIDERS } from './llm/providers';
+import { validateLlmKey, type LlmConfig } from './llm/createLlmClient';
 
 const app: Express = express();
 const PORT = process.env.PORT || 3001;
@@ -42,12 +41,16 @@ const SESSIONS_DIR = path.resolve(__dirname, '../../../recordings/sessions');
 const sessionStore = new SessionStore(SESSIONS_DIR);
 sessionStore.start();
 
-const orchestrator = process.env.ANTHROPIC_API_KEY && audioGenerator
+// Operator fallback LLM config: used when a request brings no key. Users can
+// override per-run with their own provider + key + model (BYO).
+const defaultLlm: LlmConfig | undefined = process.env.ANTHROPIC_API_KEY
+  ? { provider: 'anthropic', apiKey: process.env.ANTHROPIC_API_KEY, model: 'claude-opus-4-8' }
+  : undefined;
+
+const orchestrator = audioGenerator
   ? new PipelineOrchestrator({
       store: sessionStore,
-      planner: new Planner(process.env.ANTHROPIC_API_KEY),
-      researcher: new Researcher(process.env.ANTHROPIC_API_KEY),
-      scripter: new Scripter(process.env.ANTHROPIC_API_KEY),
+      defaultLlm,
       audioGenerator,
       fuser: new Fuser(),
       slateRenderer: new SlateRenderer(),
@@ -285,12 +288,12 @@ app.post('/api/test/audio', async (req: Request, res: Response) => {
 app.post('/api/pipeline/start', (req: Request, res: Response) => {
   if (!orchestrator) {
     res.status(503).json({
-      error: 'Pipeline unavailable. Configure ANTHROPIC_API_KEY and ELEVENLABS_API_KEY in .env.',
+      error: 'Pipeline unavailable. ELEVENLABS_API_KEY must be set on the server; an LLM key can be brought per-request or set as ANTHROPIC_API_KEY.',
       code: 'PIPELINE_UNAVAILABLE',
     });
     return;
   }
-  const { githubUrl, branch, recordUrl, userPrompt, targetDurationSec, selectedStages, skipRecording } =
+  const { githubUrl, branch, recordUrl, userPrompt, targetDurationSec, selectedStages, skipRecording, llm } =
     (req.body ?? {}) as {
       githubUrl?: string;
       branch?: string;
@@ -299,6 +302,7 @@ app.post('/api/pipeline/start', (req: Request, res: Response) => {
       targetDurationSec?: number;
       selectedStages?: string[];
       skipRecording?: boolean;
+      llm?: { provider?: string; apiKey?: string; model?: string };
     };
 
   if (!userPrompt || typeof userPrompt !== 'string' || !userPrompt.trim()) {
@@ -306,21 +310,57 @@ app.post('/api/pipeline/start', (req: Request, res: Response) => {
     return;
   }
 
-  const session = orchestrator.start({
-    githubUrl: typeof githubUrl === 'string' && githubUrl.trim() ? githubUrl.trim() : undefined,
-    branch: typeof branch === 'string' && branch.trim() ? branch.trim() : undefined,
-    recordUrl: typeof recordUrl === 'string' && recordUrl.trim() ? recordUrl.trim() : undefined,
-    userPrompt: userPrompt.trim(),
-    targetDurationSec:
-      typeof targetDurationSec === 'number' && Number.isFinite(targetDurationSec) ? targetDurationSec : undefined,
-    selectedStages: Array.isArray(selectedStages) ? (selectedStages as StageId[]) : undefined,
-    skipRecording: skipRecording === true,
-  });
-  res.status(202).json({ sessionId: session.id, status: session.status });
+  // Bring-your-own LLM, if a complete config is supplied; else the server default.
+  const llmConfig: LlmConfig | undefined =
+    llm && llm.provider && llm.apiKey && llm.model
+      ? { provider: llm.provider, apiKey: llm.apiKey, model: llm.model }
+      : undefined;
+
+  try {
+    const session = orchestrator.start({
+      githubUrl: typeof githubUrl === 'string' && githubUrl.trim() ? githubUrl.trim() : undefined,
+      branch: typeof branch === 'string' && branch.trim() ? branch.trim() : undefined,
+      recordUrl: typeof recordUrl === 'string' && recordUrl.trim() ? recordUrl.trim() : undefined,
+      userPrompt: userPrompt.trim(),
+      targetDurationSec:
+        typeof targetDurationSec === 'number' && Number.isFinite(targetDurationSec) ? targetDurationSec : undefined,
+      selectedStages: Array.isArray(selectedStages) ? (selectedStages as StageId[]) : undefined,
+      skipRecording: skipRecording === true,
+      llm: llmConfig,
+    });
+    res.status(202).json({ sessionId: session.id, status: session.status });
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : String(e), code: 'LLM_CONFIG_INVALID' });
+  }
 });
 
 app.get('/api/pipeline/stages', (_req: Request, res: Response) => {
   res.json({ stages: STAGE_DEFS });
+});
+
+// List available providers + their model options (for the BYO-key UI).
+app.get('/api/providers', (_req: Request, res: Response) => {
+  res.json({
+    providers: PROVIDERS.map((p) => ({
+      id: p.id,
+      label: p.label,
+      free: !!p.free,
+      keysUrl: p.keysUrl,
+      models: p.models,
+    })),
+    hasServerDefault: !!defaultLlm,
+  });
+});
+
+// Validate a key + model with a tiny live request, mapping errors to clear text.
+app.post('/api/validate-key', async (req: Request, res: Response) => {
+  const { provider, apiKey, model } = (req.body ?? {}) as { provider?: string; apiKey?: string; model?: string };
+  if (!provider || !apiKey || !model) {
+    res.status(400).json({ ok: false, message: '`provider`, `apiKey`, and `model` are all required.' });
+    return;
+  }
+  const result = await validateLlmKey({ provider, apiKey, model });
+  res.status(result.ok ? 200 : 200).json(result);
 });
 
 app.get('/api/pipeline/:id/status', (req: Request, res: Response) => {
@@ -412,7 +452,7 @@ app.listen(PORT, () => {
     console.warn('⚠️  ELEVENLABS_API_KEY not configured. Audio generation will be unavailable.');
   }
   if (!orchestrator) {
-    console.warn('⚠️  Full pipeline disabled — needs both ANTHROPIC_API_KEY and ELEVENLABS_API_KEY.');
+    console.warn('⚠️  Full pipeline disabled — ELEVENLABS_API_KEY is required (LLM key can be brought per-request).');
   }
 });
 
