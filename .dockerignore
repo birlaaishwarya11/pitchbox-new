@@ -1,0 +1,17 @@
+**/node_modules
+**/.next
+**/dist
+**/recordings
+**/.turbo
+**/.cache
+.git
+.gitignore
+**/.env
+**/.env.*
+!**/.env.example
+**/*.log
+.DS_Store
+CLAUDE.md
+.claude
+docs
+apps/web/public

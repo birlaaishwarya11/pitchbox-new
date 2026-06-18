@@ -11,6 +11,7 @@ import {
 } from './DaytonaDeployer';
 import { type RecordingResult } from './Recorder';
 import { getRemoteRecorderBundle } from './remoteRecorderBundle';
+import { parseJsonObject as extractJsonObject } from './llm/jsonParse';
 
 export interface SandboxRecordingRequest extends DeployFromGithubInput {
   appPort?: number;
@@ -25,8 +26,12 @@ export interface SandboxRecordingResult {
   previewUrl: string;
 }
 
-const DEFAULT_APP_PORT = 4300;
+const DEFAULT_APP_PORT = 3000;
 const DEFAULT_RECORDING_DURATION_MS = 5_000;
+// Generic defaults so arbitrary repos work: skip the build (most dev servers
+// don't need one) and run the common dev script. Callers can override both.
+const DEFAULT_BUILD_COMMAND = '';
+const DEFAULT_START_COMMAND = 'npm run dev';
 const PID_FILE = '/tmp/pitchbox-app.pid';
 const RECORDER_RUNTIME_DIR = '/tmp/pitchbox-recorder-runtime';
 const RECORDER_SCRIPT_NAME = 'recorder.mjs';
@@ -48,9 +53,13 @@ export class SandboxRecorder {
     try {
       await this.waitForLocalHttp(sandbox, appPort);
       const preview = await sandbox.getPreviewLink(appPort);
+      // The recorder runs INSIDE the sandbox, so it records the app over
+      // localhost — the external preview proxy URL is for outside access and is
+      // not reliably reachable from within the sandbox.
+      const localUrl = `http://127.0.0.1:${appPort}`;
       const remoteRecording = await this.captureRecordingInSandbox(
         sandbox,
-        preview.url,
+        localUrl,
         request.recordDurationMs ?? DEFAULT_RECORDING_DURATION_MS,
       );
       const recording = await this.persistSandboxRecording(sandbox, remoteRecording);
@@ -66,7 +75,7 @@ export class SandboxRecorder {
   }
 
   private async buildAppInSandbox(sandbox: Sandbox, repoPath: string, appBuildCommand?: string): Promise<void> {
-    const command = appBuildCommand ?? 'npm run build:web';
+    const command = appBuildCommand ?? DEFAULT_BUILD_COMMAND;
     const trimmed = command.trim();
 
     if (!trimmed) {
@@ -92,7 +101,7 @@ export class SandboxRecorder {
     port: number,
     appStartCommand?: string,
   ): Promise<void> {
-    const command = appStartCommand ?? 'npm run dev:web';
+    const command = appStartCommand ?? DEFAULT_START_COMMAND;
     const envPrefix = `PORT=${port} VITE_PORT=${port} HOST=0.0.0.0`;
     const startScript = [
       'bash -lc',
@@ -144,7 +153,10 @@ export class SandboxRecorder {
       `node ${RECORDER_SCRIPT_NAME}`,
       RECORDER_RUNTIME_DIR,
       {
-        RECORDER_ENABLE_XVFB: 'true',
+        // Headless screenshot capture (no Xvfb), using the system Chromium we
+        // install in the sandbox so Puppeteer has its shared libraries.
+        RECORDER_CAPTURE_MODE: 'screenshot',
+        PUPPETEER_EXECUTABLE_PATH: '/usr/bin/chromium',
         RECORDER_TARGET_URL: previewUrl,
         RECORDER_DURATION_MS: `${duration}`,
         RECORDER_LOG_PATH: RECORDER_LOG_FILE,
@@ -152,12 +164,36 @@ export class SandboxRecorder {
       600,
     );
 
-    const stdout = execution.artifacts?.stdout ?? execution.result ?? '';
+    const stdout = (execution.artifacts?.stdout ?? execution.result ?? '').trim();
+    const parsed = extractJsonObject(stdout);
+    if (parsed) {
+      return this.reviveRecording(parsed);
+    }
 
+    // Parsing failed — surface the real reason from the sandbox for diagnosis.
+    const stderr = (execution as any)?.artifacts?.stderr ?? '';
+    const exitCode = (execution as any)?.exitCode;
+    const log = await this.readSandboxFile(sandbox, RECORDER_LOG_FILE);
+    const detail = [
+      `exitCode=${exitCode}`,
+      stdout ? `stdout=${stdout.slice(0, 400)}` : 'stdout=<empty>',
+      stderr ? `stderr=${String(stderr).slice(-800)}` : '',
+      log ? `log=${log.slice(-800)}` : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
+    throw new DaytonaDeploymentError(
+      'SANDBOX_SETUP_FAILED',
+      `In-sandbox recorder did not return a recording.\n${detail}`,
+    );
+  }
+
+  private async readSandboxFile(sandbox: Sandbox, remotePath: string): Promise<string> {
     try {
-      return this.reviveRecording(JSON.parse(stdout));
-    } catch (error) {
-      throw new DaytonaDeploymentError('SANDBOX_SETUP_FAILED', 'Failed to parse sandbox recording output.', error);
+      const buf = await sandbox.fs.downloadFile(remotePath);
+      return buf.toString('utf-8');
+    } catch {
+      return '';
     }
   }
 
@@ -205,9 +241,12 @@ export class SandboxRecorder {
   }
 
   private async installRecorderDependencies(sandbox: Sandbox): Promise<void> {
+    // Skip Puppeteer's bundled-Chromium download — we use the system Chromium
+    // installed during sandbox setup (its libraries are guaranteed present).
     const installScript = [
       'bash -lc',
       `'cd ${RECORDER_RUNTIME_DIR} && set -euo pipefail; ` +
+        'export PUPPETEER_SKIP_DOWNLOAD=true; ' +
         'if [ ! -f package.json ]; then npm init -y >/dev/null 2>&1; fi; ' +
         'npm install --silent puppeteer xvfb' +
         "'",

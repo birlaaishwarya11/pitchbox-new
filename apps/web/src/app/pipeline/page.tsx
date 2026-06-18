@@ -96,6 +96,8 @@ export default function PipelinePage() {
   const [userPrompt, setUserPrompt] = useState(SAMPLE_PROMPTS[0].value);
   const [githubUrl, setGithubUrl] = useState('');
   const [recordUrl, setRecordUrl] = useState('');
+  const [appStartCommand, setAppStartCommand] = useState('');
+  const [sandboxPort, setSandboxPort] = useState<number | ''>('');
   const [targetDurationSec, setTargetDurationSec] = useState(90);
   // Which optional stages to run. Required stages always run.
   const [selectedOptional, setSelectedOptional] = useState<Set<StageId>>(
@@ -166,6 +168,8 @@ export default function PipelinePage() {
           userPrompt,
           githubUrl: githubUrl.trim() || undefined,
           recordUrl: recordUrl.trim() || undefined,
+          appStartCommand: appStartCommand.trim() || undefined,
+          sandboxPort: typeof sandboxPort === 'number' ? sandboxPort : undefined,
           targetDurationSec,
           selectedStages: selectedStageIds(),
           skipRecording: !recordSelected,
@@ -266,6 +270,10 @@ export default function PipelinePage() {
             setGithubUrl={setGithubUrl}
             recordUrl={recordUrl}
             setRecordUrl={setRecordUrl}
+            appStartCommand={appStartCommand}
+            setAppStartCommand={setAppStartCommand}
+            sandboxPort={sandboxPort}
+            setSandboxPort={setSandboxPort}
             targetDurationSec={targetDurationSec}
             setTargetDurationSec={setTargetDurationSec}
             selectedOptional={selectedOptional}
@@ -340,6 +348,10 @@ function InputCard(props: {
   setGithubUrl: (v: string) => void;
   recordUrl: string;
   setRecordUrl: (v: string) => void;
+  appStartCommand: string;
+  setAppStartCommand: (v: string) => void;
+  sandboxPort: number | '';
+  setSandboxPort: (v: number | '') => void;
   targetDurationSec: number;
   setTargetDurationSec: (v: number) => void;
   selectedOptional: Set<StageId>;
@@ -401,13 +413,35 @@ function InputCard(props: {
       </div>
 
       <div className="space-y-1.5">
-        <label className="text-xs text-zinc-400">GitHub URL {analyzeOn ? '(used by Analyze)' : '(optional)'}</label>
+        <label className="text-xs text-zinc-400">
+          GitHub URL {analyzeOn && recordOn ? '(Analyze + sandbox recording)' : analyzeOn ? '(used by Analyze)' : recordOn ? '(sandbox recording)' : '(optional)'}
+        </label>
         <input
           value={props.githubUrl}
           onChange={(e) => props.setGithubUrl(e.target.value)}
           placeholder="https://github.com/owner/repo"
           className="w-full rounded bg-zinc-950 border border-zinc-800 p-1.5 text-sm font-mono"
         />
+        {recordOn && props.githubUrl.trim() && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+            <input
+              value={props.appStartCommand}
+              onChange={(e) => props.setAppStartCommand(e.target.value)}
+              placeholder="start command (default: npm run dev)"
+              className="w-full rounded bg-zinc-950 border border-zinc-800 p-1.5 text-xs font-mono"
+            />
+            <input
+              type="number"
+              value={props.sandboxPort}
+              onChange={(e) => props.setSandboxPort(e.target.value ? Number(e.target.value) : '')}
+              placeholder="port (default: 3000)"
+              className="w-full rounded bg-zinc-950 border border-zinc-800 p-1.5 text-xs"
+            />
+            <p className="text-[10px] text-zinc-500 sm:col-span-2">
+              The repo is built &amp; run inside an isolated Daytona sandbox, then recorded. Set the dev command + port your app listens on.
+            </p>
+          </div>
+        )}
       </div>
 
       {/* Model provider (bring your own key). */}

@@ -105,9 +105,18 @@ const DEFAULT_SETUP_COMMANDS_FACTORY: SetupCommandFactory = ({ repoPath }) => [
   },
   {
     id: 'apt-install-system',
-    description: 'Install Xvfb, ffmpeg, and curl',
-    command: 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xvfb ffmpeg curl',
-    timeoutSec: 300,
+    description: 'Install ffmpeg, curl, Xvfb, and Chromium (with its shared libraries)',
+    // Chromium is required so the in-sandbox Puppeteer recorder can launch a
+    // browser; installing the distro package also pulls in all the shared libs
+    // Chromium needs. Fall back across package names and expose a stable path.
+    command:
+      "bash -lc 'set -e; " +
+      'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg curl xvfb ca-certificates fonts-liberation; ' +
+      '(sudo DEBIAN_FRONTEND=noninteractive apt-get install -y chromium || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y chromium-browser); ' +
+      'if [ ! -e /usr/bin/chromium ]; then P="$(command -v chromium || command -v chromium-browser || true)"; ' +
+      '[ -n "$P" ] && sudo ln -sf "$P" /usr/bin/chromium || true; fi; ' +
+      "/usr/bin/chromium --version || true'",
+    timeoutSec: 420,
   },
   {
     id: 'npm-install',

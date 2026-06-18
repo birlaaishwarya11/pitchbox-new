@@ -62,6 +62,10 @@ export interface PipelineSession {
     githubUrl?: string;
     branch?: string;
     recordUrl?: string;
+    // Daytona sandbox recording config (used when recording a GitHub repo).
+    appStartCommand?: string;
+    appBuildCommand?: string;
+    sandboxPort?: number;
     userPrompt: string;
     targetDurationSec: number;
   };

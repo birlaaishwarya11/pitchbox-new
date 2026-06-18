@@ -49,6 +49,10 @@ export interface StartInput {
   branch?: string;
   // A deployed/public URL to screen-record directly (no Daytona).
   recordUrl?: string;
+  // Daytona sandbox recording config (when recording a GitHub repo).
+  appStartCommand?: string;
+  appBuildCommand?: string;
+  sandboxPort?: number;
   userPrompt: string;
   targetDurationSec?: number;
   // Which optional stages to run. Required stages always run; dependencies are
@@ -91,6 +95,9 @@ export class PipelineOrchestrator {
         githubUrl: input.githubUrl,
         branch: input.branch,
         recordUrl: input.recordUrl,
+        appStartCommand: input.appStartCommand,
+        appBuildCommand: input.appBuildCommand,
+        sandboxPort: input.sandboxPort,
         userPrompt: input.userPrompt,
         targetDurationSec: input.targetDurationSec ?? 90,
       },
@@ -377,8 +384,11 @@ export class PipelineOrchestrator {
 
     store.setStage(sessionId, 'record', { status: 'running' });
     // Hard ceiling so a wedged recorder can never stall the pipeline — on
-    // timeout we abandon the capture and fall back to a slate.
-    const recordCeilingMs = Math.max(recordDurationMs, 60_000) + 60_000;
+    // timeout we abandon the capture and fall back to a slate. The Daytona path
+    // (provision → clone → install → build → run → record) needs far longer than
+    // a direct URL capture.
+    const isSandbox = !session.input.recordUrl && !!session.input.githubUrl;
+    const recordCeilingMs = isSandbox ? 12 * 60_000 : Math.max(recordDurationMs, 60_000) + 60_000;
     const label = session.input.recordUrl ? session.input.recordUrl : 'sandbox capture';
 
     // Recording is the flakiest leg, so retry once before giving up.
@@ -432,6 +442,9 @@ export class PipelineOrchestrator {
           githubUrl: session.input.githubUrl,
           branch: session.input.branch,
           recordDurationMs,
+          appStartCommand: session.input.appStartCommand,
+          appBuildCommand: session.input.appBuildCommand,
+          appPort: session.input.sandboxPort,
         }),
         recordCeilingMs,
         'sandbox recording',

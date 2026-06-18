@@ -35,8 +35,13 @@ const audioGenerator = process.env.ELEVENLABS_API_KEY && !process.env.ELEVENLABS
   ? new AudioGenerator(process.env.ELEVENLABS_API_KEY)
   : null;
 
-const TEST_AUDIO_DIR = path.resolve(__dirname, '../../../recordings/test-audio');
-const SESSIONS_DIR = path.resolve(__dirname, '../../../recordings/sessions');
+// Media output dir. Override with MEDIA_DIR in production to point at a mounted
+// persistent volume so generated videos survive restarts/redeploys.
+const MEDIA_DIR = process.env.MEDIA_DIR
+  ? path.resolve(process.env.MEDIA_DIR)
+  : path.resolve(__dirname, '../../../recordings');
+const TEST_AUDIO_DIR = path.join(MEDIA_DIR, 'test-audio');
+const SESSIONS_DIR = path.join(MEDIA_DIR, 'sessions');
 
 const sessionStore = new SessionStore(SESSIONS_DIR);
 sessionStore.start();
@@ -46,6 +51,14 @@ sessionStore.start();
 const defaultLlm: LlmConfig | undefined = process.env.ANTHROPIC_API_KEY
   ? { provider: 'anthropic', apiKey: process.env.ANTHROPIC_API_KEY, model: 'claude-opus-4-8' }
   : undefined;
+
+// Daytona sandbox — isolated execution for recording untrusted GitHub repos
+// (building/running a stranger's code must never happen on the host). Created
+// eagerly when DAYTONA_API_KEY is present; null otherwise.
+const daytonaDeployer: DaytonaDeployer | null = process.env.DAYTONA_API_KEY
+  ? new DaytonaDeployer(undefined, { defaultWorkspaceDir: process.env.DAYTONA_WORKSPACE_DIR })
+  : null;
+const sandboxRecorder: SandboxRecorder | null = daytonaDeployer ? new SandboxRecorder(daytonaDeployer) : null;
 
 const orchestrator = audioGenerator
   ? new PipelineOrchestrator({
@@ -59,32 +72,11 @@ const orchestrator = audioGenerator
       flowExtractor,
       // Records a deployed/public URL directly (no Daytona required).
       urlRecorder: recorder,
-      // sandboxRecorder is wired lazily via getSandboxRecorder() to avoid
-      // requiring DAYTONA_API_KEY at boot. We pass undefined here and the
-      // orchestrator will fall back to the slate path when undefined.
-      sandboxRecorder: undefined,
+      // Records a GitHub repo by building + running it inside a Daytona sandbox.
+      sandboxRecorder: sandboxRecorder ?? undefined,
       publicMediaPrefix: '/sessions',
     })
   : null;
-
-// Lazy-initialize Daytona services so the server can boot without credentials
-let daytonaDeployer: DaytonaDeployer | null = null;
-let sandboxRecorder: SandboxRecorder | null = null;
-
-function getDaytonaDeployer(): DaytonaDeployer {
-  if (!daytonaDeployer) {
-    daytonaDeployer = new DaytonaDeployer(undefined, {
-      defaultWorkspaceDir: process.env.DAYTONA_WORKSPACE_DIR,
-    });
-    sandboxRecorder = new SandboxRecorder(daytonaDeployer);
-  }
-  return daytonaDeployer;
-}
-
-function getSandboxRecorder(): SandboxRecorder {
-  getDaytonaDeployer();
-  return sandboxRecorder!;
-}
 
 type DeployRequestBody = {
   githubUrl?: string;
@@ -108,7 +100,10 @@ type RecordRequestBody = {
 };
 
 app.use(express.json({ limit: '2mb' }));
-app.use(cors());
+// CORS: in production set CORS_ORIGIN to your web origin(s), comma-separated;
+// defaults to permissive for local dev.
+const corsOrigins = process.env.CORS_ORIGIN?.split(',').map((s) => s.trim()).filter(Boolean);
+app.use(cors(corsOrigins && corsOrigins.length ? { origin: corsOrigins } : undefined));
 app.use('/test-audio', express.static(TEST_AUDIO_DIR));
 app.use('/sessions', express.static(SESSIONS_DIR));
 
@@ -135,8 +130,12 @@ app.post('/api/record', async (req: Request, res: Response) => {
   } = req.body as RecordRequestBody;
 
   if (githubUrl && typeof githubUrl === 'string') {
+    if (!sandboxRecorder) {
+      res.status(503).json({ error: 'Daytona is not configured (set DAYTONA_API_KEY).', code: 'DAYTONA_UNAVAILABLE' });
+      return;
+    }
     try {
-      const sandboxResult = await getSandboxRecorder().recordRepository({
+      const sandboxResult = await sandboxRecorder.recordRepository({
         githubUrl,
         branch: typeof branch === 'string' && branch.trim().length > 0 ? branch.trim() : undefined,
         commitId: typeof commitId === 'string' && commitId.trim().length > 0 ? commitId.trim() : undefined,
@@ -207,9 +206,13 @@ app.post('/api/deploy', async (req: Request, res: Response) => {
       .json({ error: 'A `githubUrl` field is required in the request body.', code: 'INVALID_GITHUB_URL' });
     return;
   }
+  if (!daytonaDeployer) {
+    res.status(503).json({ error: 'Daytona is not configured (set DAYTONA_API_KEY).', code: 'DAYTONA_UNAVAILABLE' });
+    return;
+  }
 
   try {
-    const deployment = await getDaytonaDeployer().deployFromGithub({
+    const deployment = await daytonaDeployer.deployFromGithub({
       githubUrl,
       branch: typeof branch === 'string' && branch.trim().length > 0 ? branch.trim() : undefined,
       commitId: typeof commitId === 'string' && commitId.trim().length > 0 ? commitId.trim() : undefined,
@@ -293,17 +296,31 @@ app.post('/api/pipeline/start', (req: Request, res: Response) => {
     });
     return;
   }
-  const { githubUrl, branch, recordUrl, userPrompt, targetDurationSec, selectedStages, skipRecording, llm } =
-    (req.body ?? {}) as {
-      githubUrl?: string;
-      branch?: string;
-      recordUrl?: string;
-      userPrompt?: string;
-      targetDurationSec?: number;
-      selectedStages?: string[];
-      skipRecording?: boolean;
-      llm?: { provider?: string; apiKey?: string; model?: string };
-    };
+  const {
+    githubUrl,
+    branch,
+    recordUrl,
+    appStartCommand,
+    appBuildCommand,
+    sandboxPort,
+    userPrompt,
+    targetDurationSec,
+    selectedStages,
+    skipRecording,
+    llm,
+  } = (req.body ?? {}) as {
+    githubUrl?: string;
+    branch?: string;
+    recordUrl?: string;
+    appStartCommand?: string;
+    appBuildCommand?: string;
+    sandboxPort?: number;
+    userPrompt?: string;
+    targetDurationSec?: number;
+    selectedStages?: string[];
+    skipRecording?: boolean;
+    llm?: { provider?: string; apiKey?: string; model?: string };
+  };
 
   if (!userPrompt || typeof userPrompt !== 'string' || !userPrompt.trim()) {
     res.status(400).json({ error: 'A `userPrompt` field is required.' });
@@ -321,6 +338,9 @@ app.post('/api/pipeline/start', (req: Request, res: Response) => {
       githubUrl: typeof githubUrl === 'string' && githubUrl.trim() ? githubUrl.trim() : undefined,
       branch: typeof branch === 'string' && branch.trim() ? branch.trim() : undefined,
       recordUrl: typeof recordUrl === 'string' && recordUrl.trim() ? recordUrl.trim() : undefined,
+      appStartCommand: typeof appStartCommand === 'string' && appStartCommand.trim() ? appStartCommand.trim() : undefined,
+      appBuildCommand: typeof appBuildCommand === 'string' && appBuildCommand.trim() ? appBuildCommand.trim() : undefined,
+      sandboxPort: typeof sandboxPort === 'number' && Number.isInteger(sandboxPort) ? sandboxPort : undefined,
       userPrompt: userPrompt.trim(),
       targetDurationSec:
         typeof targetDurationSec === 'number' && Number.isFinite(targetDurationSec) ? targetDurationSec : undefined,
