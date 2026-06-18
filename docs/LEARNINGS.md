@@ -141,3 +141,51 @@ the request's provider/key/model, kept in a `Map` keyed by session id.
 memory) with a clear error instead of a crash. And validate a key/model with a
 tiny live call, mapping `401→invalid key`, `404→model not found`,
 `429→rate limited` to human text.
+
+---
+# Phase 3 + 4 (sandboxed repo recording, hosting)
+
+## 19. Don't edit watched files mid-test (again)
+**What happened:** while a 2-minute Daytona run was in flight, I edited a server
+file → `tsx watch` restarted → the in-memory session vanished → the run died.
+This is learning #9, re-learned the hard way.
+**Lesson:** when a long run is going, only touch *non-watched* files (docs,
+Dockerfile). Batch your source edits for after it finishes.
+
+## 20. Make the failure tell you why, before guessing
+**What happened:** the sandbox recorder failed with a generic "couldn't parse
+output." I almost guessed at fixes; instead I changed the error to capture the
+in-sandbox `exitCode` + `stderr` + log file.
+**Payoff:** three *distinct* root causes surfaced across runs — Xvfb noise in
+stdout, missing Chromium, wrong URL — each obvious once the real error showed.
+**Lesson:** spend the first iteration making the error legible. Diagnose, then
+fix. Guessing burns the expensive cycles.
+
+## 21. Record over localhost *inside* the sandbox, not the public proxy
+**Assumed:** record the app via its external Daytona preview URL.
+**Reality:** the recorder runs *inside* the sandbox; the external preview proxy
+isn't reliably reachable from within. Navigation just failed.
+**Lesson:** from inside the box, hit `http://127.0.0.1:<port>` — the app is
+local to you. Use the public URL only for outside access.
+
+## 22. A fresh sandbox has no browser — and no browser *libraries*
+**Reality:** Puppeteer in the sandbox failed because the base image had neither
+Chromium nor its shared libs. Installing the distro `chromium` package pulls in
+both; then point Puppeteer at it and skip its bundled-Chromium download.
+**Lesson:** "it works on my machine" hides all the system libs a headless
+browser needs. A clean container/sandbox needs them installed explicitly.
+
+## 23. Sandbox isolation IS the feature, not overhead
+**Why Daytona matters:** recording a user's GitHub repo means *building and
+running their code*. Doing that on the host is remote code execution waiting to
+happen. The sandbox is the security boundary — untrusted repos run there, never
+on the host. Recording a plain URL (just visiting a page) is safe on the host.
+**Lesson:** match the isolation to the trust level of what you're executing.
+
+## 24. Run TypeScript directly in prod when build-time assumptions break
+**Reality:** the server bundles its in-sandbox recorder from `.ts` source at
+runtime (esbuild). A `tsc → dist/` image drops those `.ts` files, breaking it.
+**Lesson:** running via `tsx` in the container (no precompile) kept the source
+present and sidestepped the whole class of "works in dev, missing in dist"
+problems. Validate that your build artifact actually contains what runtime
+reads.
