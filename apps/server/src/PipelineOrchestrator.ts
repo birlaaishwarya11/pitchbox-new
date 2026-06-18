@@ -11,6 +11,7 @@ import type { CodebaseAnalyzer, AnalysisResult } from './CodebaseAnalyzer';
 import type { FlowExtractor } from './FlowExtractor';
 import type { SandboxRecorder } from './SandboxRecorder';
 import type { Recorder } from './Recorder';
+import type { SlateRenderer } from './SlateRenderer';
 import { resolveSelectedStages, type StageId } from './pipelineStages';
 
 export interface PipelineDeps {
@@ -27,6 +28,8 @@ export interface PipelineDeps {
   // Records a plain URL locally (Puppeteer + ffmpeg) — used when a deployed
   // `recordUrl` is supplied instead of a GitHub repo + Daytona sandbox.
   urlRecorder?: Recorder;
+  // Renders a branded slate PNG when there is no screen recording.
+  slateRenderer?: SlateRenderer;
   // Public URL prefix for static-served session files. Final URLs become
   // `${publicMediaPrefix}/${sessionId}/<file>`.
   publicMediaPrefix: string;
@@ -278,11 +281,33 @@ export class PipelineOrchestrator {
     // 2. Fuse
     store.setStage(sessionId, 'fuse', { status: 'running' });
     store.setStatus(sessionId, 'FUSING');
+
+    // When there is no recording, render a branded slate image to use as the
+    // background (instead of a black frame from ffmpeg drawtext).
+    let slateImagePath: string | undefined;
+    if (!video && this.deps.slateRenderer) {
+      try {
+        slateImagePath = path.join(sessionDir, 'slate.png');
+        await this.deps.slateRenderer.render(
+          {
+            title: session.plan?.primaryGoal || 'Your demo, narrated.',
+            subtitle: session.plan?.audience,
+            wordmark: 'Pitchbox',
+          },
+          slateImagePath,
+        );
+      } catch (err) {
+        console.warn(`[pipeline ${sessionId}] slate render failed, using ffmpeg fallback:`, err);
+        slateImagePath = undefined;
+      }
+    }
+
     const fused = await this.deps.fuser.fuse({
       audioPath: audio.filePath,
       videoPath: video?.filePath,
       outputDir: sessionDir,
       slateTitle: session.plan?.audience ? `Pitchbox · ${session.plan.audience}` : 'Pitchbox demo',
+      slateImagePath,
     });
     store.update(sessionId, (s) => {
       s.finalVideo = {

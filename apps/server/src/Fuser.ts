@@ -9,6 +9,10 @@ export interface FuseInput {
   outputDir: string;
   // Optional title text rendered onto the slate when no video is provided.
   slateTitle?: string;
+  // Optional pre-rendered slate image (PNG). When provided, it is looped as the
+  // slate background instead of relying on ffmpeg drawtext (which needs
+  // libfreetype and renders black when unavailable).
+  slateImagePath?: string;
 }
 
 export interface FuseResult {
@@ -60,7 +64,12 @@ export class Fuser {
       };
     }
 
-    await runSlate(input.audioPath, filePath, input.slateTitle ?? 'Pitchbox demo');
+    const slateImage = input.slateImagePath ? await safeStat(input.slateImagePath) : null;
+    if (input.slateImagePath && slateImage) {
+      await runImageSlate(input.slateImagePath, input.audioPath, filePath);
+    } else {
+      await runSlate(input.audioPath, filePath, input.slateTitle ?? 'Pitchbox demo');
+    }
     const out = await stat(filePath);
     return {
       filePath,
@@ -70,6 +79,34 @@ export class Fuser {
       mode: 'slate',
     };
   }
+}
+
+async function runImageSlate(imagePath: string, audioPath: string, outputPath: string): Promise<void> {
+  // Loop a still PNG as the video track for the length of the audio.
+  const args = [
+    '-y',
+    '-loop',
+    '1',
+    '-i',
+    imagePath,
+    '-i',
+    audioPath,
+    '-c:v',
+    'libx264',
+    '-tune',
+    'stillimage',
+    '-pix_fmt',
+    'yuv420p',
+    '-vf',
+    'scale=1280:720',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '192k',
+    '-shortest',
+    outputPath,
+  ];
+  await runFfmpeg(args);
 }
 
 async function runMux(videoPath: string, audioPath: string, outputPath: string): Promise<void> {
