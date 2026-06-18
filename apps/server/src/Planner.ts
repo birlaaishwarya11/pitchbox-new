@@ -14,7 +14,7 @@ export class PlannerError extends Error {
   }
 }
 
-const MODEL = 'claude-opus-4-7';
+const MODEL = 'claude-opus-4-8';
 
 export class Planner {
   private readonly client: Anthropic;
@@ -31,7 +31,6 @@ export class Planner {
       const response = await this.client.messages.create({
         model: MODEL,
         max_tokens: 1024,
-        temperature: 0.4,
         system: SYSTEM,
         messages: [
           {

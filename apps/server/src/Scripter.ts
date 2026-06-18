@@ -23,7 +23,7 @@ export class ScripterError extends Error {
   }
 }
 
-const MODEL = 'claude-opus-4-7';
+const MODEL = 'claude-opus-4-8';
 
 export class Scripter {
   private readonly client: Anthropic;
@@ -38,7 +38,6 @@ export class Scripter {
       const response = await this.client.messages.create({
         model: MODEL,
         max_tokens: 2048,
-        temperature: 0.7,
         system: SYSTEM,
         messages: [{ role: 'user', content: buildUserMessage(input) }],
       });

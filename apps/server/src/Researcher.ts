@@ -13,7 +13,39 @@ export class ResearcherError extends Error {
   }
 }
 
-const MODEL = 'claude-opus-4-7';
+const MODEL = 'claude-opus-4-8';
+const MAX_TOKENS = 2500;
+
+// Structured-output tool. Forcing the model to answer via this tool means the
+// SDK returns a parsed object — no brittle JSON-from-text parsing, and no
+// truncation-induced parse failures.
+const RESEARCH_TOOL: Anthropic.Tool = {
+  name: 'submit_research',
+  description: 'Submit the demo-video research findings as structured data.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      summary: { type: 'string', description: '2-4 sentence summary of the winning approach for this use case.' },
+      dos: { type: 'array', items: { type: 'string' }, description: 'Up to 6 concrete dos.' },
+      donts: { type: 'array', items: { type: 'string' }, description: 'Up to 6 concrete donts.' },
+      examplesOrPatterns: { type: 'array', items: { type: 'string' }, description: 'Up to 5 patterns or examples.' },
+      citations: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: { title: { type: 'string' }, url: { type: 'string' } },
+          required: ['url'],
+        },
+        description: 'Optional sources; may be empty.',
+      },
+    },
+    required: ['summary', 'dos', 'donts', 'examplesOrPatterns', 'citations'],
+  },
+};
+
+const SYSTEM = `You are a research agent for demo-video scripts. Use your knowledge of demo-video best practices for hackathons, marketing landing pages, LinkedIn launches, YouTube, and Twitter/X.
+
+Give concrete, actionable guidance specific to the user's use case (audience + goal + tone), not generic video advice. Keep each list to at most 6 short items. Submit your findings by calling the submit_research tool.`;
 
 export class Researcher {
   private readonly client: Anthropic;
@@ -24,52 +56,46 @@ export class Researcher {
   }
 
   async research(input: ResearcherInput): Promise<ResearchArtifact> {
-    const userMessage = buildUserMessage(input);
-
-    // First try with Anthropic's native server-side web_search tool.
-    // If unavailable on this account / SDK version, fall back to library knowledge.
     try {
-      return await this.researchWithWebSearch(userMessage);
-    } catch (error) {
-      console.warn(
-        '[Researcher] web_search tool unavailable, falling back to library knowledge:',
-        error instanceof Error ? error.message : error,
+      const response = await this.client.messages.create({
+        model: MODEL,
+        max_tokens: MAX_TOKENS,
+        system: SYSTEM,
+        tools: [RESEARCH_TOOL],
+        tool_choice: { type: 'tool', name: RESEARCH_TOOL.name },
+        messages: [{ role: 'user', content: buildUserMessage(input) }],
+      });
+
+      const toolUse = response.content.find(
+        (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use' && b.name === RESEARCH_TOOL.name,
       );
-      return await this.researchFromLibrary(userMessage);
+      if (!toolUse) {
+        throw new ResearcherError('Researcher did not return structured output');
+      }
+      return normalizeResearch(toolUse.input as Record<string, unknown>);
+    } catch (error) {
+      if (error instanceof ResearcherError) throw error;
+      throw new ResearcherError(
+        error instanceof Error ? `Researcher failed: ${error.message}` : 'Researcher failed',
+        error,
+      );
     }
   }
+}
 
-  private async researchWithWebSearch(userMessage: string): Promise<ResearchArtifact> {
-    // Cast to any: the typed Anthropic SDK may not yet expose web_search; the API accepts it.
-    const response: any = await (this.client.messages.create as any)({
-      model: MODEL,
-      max_tokens: 1500,
-      temperature: 0.3,
-      system: SYSTEM_WITH_SEARCH,
-      tools: [
-        {
-          type: 'web_search_20250305',
-          name: 'web_search',
-          max_uses: 4,
-        },
-      ],
-      messages: [{ role: 'user', content: userMessage }],
-    });
-
-    return parseFinalJson(response, /* expectCitations */ true);
-  }
-
-  private async researchFromLibrary(userMessage: string): Promise<ResearchArtifact> {
-    const response = await this.client.messages.create({
-      model: MODEL,
-      max_tokens: 1200,
-      temperature: 0.3,
-      system: SYSTEM_LIBRARY,
-      messages: [{ role: 'user', content: userMessage }],
-    });
-
-    return parseFinalJson(response, /* expectCitations */ false);
-  }
+function normalizeResearch(input: Record<string, unknown>): ResearchArtifact {
+  const arr = (v: unknown): string[] => (Array.isArray(v) ? v.map((x) => String(x)) : []);
+  return {
+    summary: typeof input.summary === 'string' ? input.summary : '',
+    dos: arr(input.dos),
+    donts: arr(input.donts),
+    examplesOrPatterns: arr(input.examplesOrPatterns),
+    citations: Array.isArray(input.citations)
+      ? (input.citations as any[])
+          .filter((c) => c && typeof c.url === 'string')
+          .map((c) => ({ title: String(c.title ?? ''), url: String(c.url) }))
+      : [],
+  };
 }
 
 function buildUserMessage(input: ResearcherInput): string {
@@ -87,64 +113,4 @@ function buildUserMessage(input: ResearcherInput): string {
     ``,
     `Research dos and don'ts for THIS specific use case (audience + goal + tone), not generic video advice. Be concrete and actionable.`,
   ].join('\n');
-}
-
-const SYSTEM_WITH_SEARCH = `You are a research agent for demo-video scripts. Use the web_search tool to find current (2026) patterns for the user's specific use case — hackathon submissions, marketing landing pages, LinkedIn launches, YouTube demos, etc.
-
-Search for things like:
-- "hackathon demo video tips 2026"
-- "<platform> demo video best practices"
-- "demo video first 5 seconds hook"
-
-After at most 4 searches, output strictly this JSON shape, no prose, no markdown fences:
-{
-  "summary": string,
-  "dos": string[],
-  "donts": string[],
-  "examplesOrPatterns": string[],
-  "citations": [{ "title": string, "url": string }]
-}`;
-
-const SYSTEM_LIBRARY = `You are a research agent for demo-video scripts. Web search is unavailable, so use your training knowledge of demo-video best practices for hackathons, marketing, LinkedIn, YouTube, and Twitter/X.
-
-Be concrete. Output strictly this JSON shape, no prose, no markdown fences. Citations may be empty:
-{
-  "summary": string,
-  "dos": string[],
-  "donts": string[],
-  "examplesOrPatterns": string[],
-  "citations": [{ "title": string, "url": string }]
-}`;
-
-function parseFinalJson(response: any, expectCitations: boolean): ResearchArtifact {
-  // Find the last text block — when web_search runs, the assistant emits tool_use / tool_result
-  // blocks in between, and the final structured answer is the trailing text block.
-  const blocks: any[] = response.content || [];
-  const lastText = [...blocks].reverse().find((b) => b?.type === 'text');
-  if (!lastText || typeof lastText.text !== 'string') {
-    throw new ResearcherError('Researcher produced no text block');
-  }
-
-  const trimmed = lastText.text.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
-  const candidate = fenced ? fenced[1].trim() : trimmed;
-
-  let parsed: any;
-  try {
-    parsed = JSON.parse(candidate);
-  } catch {
-    throw new ResearcherError(`Researcher returned non-JSON: ${candidate.slice(0, 200)}`);
-  }
-
-  return {
-    summary: String(parsed.summary || ''),
-    dos: Array.isArray(parsed.dos) ? parsed.dos.map(String) : [],
-    donts: Array.isArray(parsed.donts) ? parsed.donts.map(String) : [],
-    examplesOrPatterns: Array.isArray(parsed.examplesOrPatterns) ? parsed.examplesOrPatterns.map(String) : [],
-    citations: Array.isArray(parsed.citations)
-      ? parsed.citations
-          .filter((c: any) => c && typeof c.url === 'string')
-          .map((c: any) => ({ title: String(c.title || ''), url: String(c.url) }))
-      : [],
-  };
 }
