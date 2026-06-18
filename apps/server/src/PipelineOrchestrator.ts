@@ -15,6 +15,9 @@ import type { Recorder } from './Recorder';
 import type { SlateRenderer } from './SlateRenderer';
 import { resolveSelectedStages, type StageId } from './pipelineStages';
 
+// Recording is the flakiest stage; total attempts = 1 try + (this - 1) retries.
+const RECORD_MAX_ATTEMPTS = 2;
+
 interface SessionAgents {
   planner: Planner;
   researcher: Researcher;
@@ -363,43 +366,79 @@ export class PipelineOrchestrator {
     recordDurationMs: number,
   ): Promise<{ filePath: string } | null> {
     const store = this.deps.store;
+
+    const hasTarget =
+      (session.input.recordUrl && this.deps.urlRecorder) ||
+      (session.input.githubUrl && this.deps.sandboxRecorder);
+    if (!hasTarget) {
+      store.skipStage(sessionId, 'record');
+      return null;
+    }
+
     store.setStage(sessionId, 'record', { status: 'running' });
     // Hard ceiling so a wedged recorder can never stall the pipeline — on
     // timeout we abandon the capture and fall back to a slate.
     const recordCeilingMs = Math.max(recordDurationMs, 60_000) + 60_000;
-    try {
-      if (session.input.recordUrl && this.deps.urlRecorder) {
-        const rec = await withTimeout(
-          this.deps.urlRecorder.record(session.input.recordUrl),
-          recordCeilingMs,
-          'URL recording',
-        );
-        const filePath = await this.stageRecordedFile(sessionId, session, rec.localPath);
-        store.setStage(sessionId, 'record', { status: 'done', message: session.input.recordUrl });
+    const label = session.input.recordUrl ? session.input.recordUrl : 'sandbox capture';
+
+    // Recording is the flakiest leg, so retry once before giving up.
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= RECORD_MAX_ATTEMPTS; attempt++) {
+      try {
+        const localPath = await this.recordOnce(session, recordDurationMs, recordCeilingMs);
+        const filePath = await this.stageRecordedFile(sessionId, session, localPath);
+        store.setStage(sessionId, 'record', {
+          status: 'done',
+          message: attempt > 1 ? `${label} (retry ${attempt - 1})` : label,
+        });
         return { filePath };
+      } catch (err) {
+        lastErr = err;
+        console.warn(`[pipeline ${sessionId}] recording attempt ${attempt}/${RECORD_MAX_ATTEMPTS} failed:`, err);
+        if (attempt < RECORD_MAX_ATTEMPTS) {
+          store.setStage(sessionId, 'record', {
+            status: 'running',
+            message: `attempt ${attempt} failed — retrying…`,
+          });
+        }
       }
-      if (session.input.githubUrl && this.deps.sandboxRecorder) {
-        const res = await withTimeout(
-          this.deps.sandboxRecorder.recordRepository({
-            githubUrl: session.input.githubUrl,
-            branch: session.input.branch,
-            recordDurationMs,
-          }),
-          recordCeilingMs,
-          'sandbox recording',
-        );
-        const filePath = await this.stageRecordedFile(sessionId, session, res.recording.localPath);
-        store.setStage(sessionId, 'record', { status: 'done', message: 'sandbox capture' });
-        return { filePath };
-      }
-      // Nothing to record against.
-      store.skipStage(sessionId, 'record');
-      return null;
-    } catch (err) {
-      console.warn(`[pipeline ${sessionId}] recording failed, falling back to slate:`, err);
-      store.setStage(sessionId, 'record', { status: 'failed', message: String((err as any)?.message ?? err) });
-      return null;
     }
+
+    console.warn(`[pipeline ${sessionId}] recording failed after ${RECORD_MAX_ATTEMPTS} attempts, falling back to slate.`);
+    store.setStage(sessionId, 'record', {
+      status: 'failed',
+      message: `failed after ${RECORD_MAX_ATTEMPTS} attempts — using slate. ${String((lastErr as any)?.message ?? lastErr)}`,
+    });
+    return null;
+  }
+
+  /** A single recording attempt against the configured target. Throws on failure. */
+  private async recordOnce(
+    session: PipelineSession,
+    recordDurationMs: number,
+    recordCeilingMs: number,
+  ): Promise<string> {
+    if (session.input.recordUrl && this.deps.urlRecorder) {
+      const rec = await withTimeout(
+        this.deps.urlRecorder.record(session.input.recordUrl),
+        recordCeilingMs,
+        'URL recording',
+      );
+      return rec.localPath;
+    }
+    if (session.input.githubUrl && this.deps.sandboxRecorder) {
+      const res = await withTimeout(
+        this.deps.sandboxRecorder.recordRepository({
+          githubUrl: session.input.githubUrl,
+          branch: session.input.branch,
+          recordDurationMs,
+        }),
+        recordCeilingMs,
+        'sandbox recording',
+      );
+      return res.recording.localPath;
+    }
+    throw new Error('No recording target available');
   }
 
   /**
