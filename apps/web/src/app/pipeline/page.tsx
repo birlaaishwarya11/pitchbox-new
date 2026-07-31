@@ -1,8 +1,25 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { createClient } from '@/lib/supabase/client';
 
 const SERVER_BASE = process.env.NEXT_PUBLIC_SERVER_BASE || 'http://localhost:3001';
+
+// Lazily construct the browser Supabase client (only on first use, i.e. in the
+// browser) so it never runs during server-side prerender.
+let _supabase: ReturnType<typeof createClient> | null = null;
+function sb() {
+  return (_supabase ??= createClient());
+}
+
+/** fetch() with the Supabase access token attached; the server verifies it. */
+async function authFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  const { data } = await sb().auth.getSession();
+  const token = data.session?.access_token;
+  const headers = new Headers(init.headers);
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  return fetch(input, { ...init, headers });
+}
 
 type Status = 'CREATED' | 'PLANNING' | 'RESEARCHING' | 'SCRIPT_DRAFT' | 'GENERATING' | 'FUSING' | 'READY' | 'ERROR';
 
@@ -117,6 +134,16 @@ export default function PipelinePage() {
     return [...ids, ...selectedOptional];
   };
 
+  // Signed-in user (for the header + sign out).
+  const [userEmail, setUserEmail] = useState<string | null>(null);
+  useEffect(() => {
+    sb().auth.getUser().then(({ data }) => setUserEmail(data.user?.email ?? null));
+  }, []);
+  const handleSignOut = async () => {
+    await sb().auth.signOut();
+    window.location.href = '/login';
+  };
+
   // Bring-your-own LLM config (null = use the server default, if any).
   const [llm, setLlm] = useState<LlmCfg | null>(null);
 
@@ -136,7 +163,7 @@ export default function PipelinePage() {
 
   const refresh = useCallback(async (id: string) => {
     try {
-      const r = await fetch(`${SERVER_BASE}/api/pipeline/${id}/status`);
+      const r = await authFetch(`${SERVER_BASE}/api/pipeline/${id}/status`);
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
       setSession(data);
@@ -161,7 +188,7 @@ export default function PipelinePage() {
     setError(null);
     setSession(null);
     try {
-      const r = await fetch(`${SERVER_BASE}/api/pipeline/start`, {
+      const r = await authFetch(`${SERVER_BASE}/api/pipeline/start`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -191,7 +218,7 @@ export default function PipelinePage() {
     setIterating(true);
     setError(null);
     try {
-      const r = await fetch(`${SERVER_BASE}/api/pipeline/${session.id}/feedback`, {
+      const r = await authFetch(`${SERVER_BASE}/api/pipeline/${session.id}/feedback`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ feedback }),
@@ -211,7 +238,7 @@ export default function PipelinePage() {
     if (!session) return;
     setError(null);
     try {
-      const r = await fetch(`${SERVER_BASE}/api/pipeline/${session.id}/approve`, {
+      const r = await authFetch(`${SERVER_BASE}/api/pipeline/${session.id}/approve`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ skipRecording: !recordSelected }),
@@ -229,7 +256,7 @@ export default function PipelinePage() {
     if (!session) return;
     setError(null);
     try {
-      const r = await fetch(`${SERVER_BASE}/api/pipeline/${session.id}/reiterate`, { method: 'POST' });
+      const r = await authFetch(`${SERVER_BASE}/api/pipeline/${session.id}/reiterate`, { method: 'POST' });
       const data = await r.json();
       if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
       setSession(data);
@@ -249,7 +276,17 @@ export default function PipelinePage() {
     <main className="min-h-screen bg-zinc-950 text-zinc-100 p-6 md:p-10">
       <div className="max-w-5xl mx-auto space-y-8">
         <header className="space-y-2">
-          <p className="text-xs uppercase tracking-widest text-zinc-500">Pipeline</p>
+          <div className="flex items-start justify-between gap-4">
+            <p className="text-xs uppercase tracking-widest text-zinc-500">Pipeline</p>
+            {userEmail && (
+              <div className="flex items-center gap-3 text-xs text-zinc-400">
+                <span className="hidden sm:inline">{userEmail}</span>
+                <button onClick={handleSignOut} className="underline hover:text-white">
+                  Sign out
+                </button>
+              </div>
+            )}
+          </div>
           <h1 className="text-3xl md:text-4xl font-semibold tracking-tight">Pitchbox · demo video pipeline</h1>
           <p className="text-sm text-zinc-400 max-w-3xl">
             Plan → research → script → approval → audio + video → fusion. Session-only state, no persistence.

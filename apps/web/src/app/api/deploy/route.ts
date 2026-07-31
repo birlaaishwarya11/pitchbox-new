@@ -28,7 +28,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'GitHub URL is required' }, { status: 400 });
   }
 
-  const serverUrl = process.env.NEXT_PUBLIC_SERVER_URL || DEFAULT_SERVER_URL;
+  const serverUrl =
+    process.env.NEXT_PUBLIC_SERVER_BASE || process.env.NEXT_PUBLIC_SERVER_URL || DEFAULT_SERVER_URL;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
 

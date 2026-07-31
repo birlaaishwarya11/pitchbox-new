@@ -13,6 +13,7 @@
     "@anthropic-ai/sdk": "^0.32.1",
     "@daytonaio/sdk": "^0.115.0",
     "@elevenlabs/elevenlabs-js": "^2.44.0",
+    "@supabase/supabase-js": "^2.110.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "esbuild": "^0.27.0",

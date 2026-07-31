@@ -1,14 +1,11 @@
+// MUST be first: populates process.env before any env-reading import runs.
+import './loadEnv';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import dotenv from 'dotenv';
 import express, { type Express, type Request, type Response } from 'express';
 import cors from 'cors';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// Load the repo-root .env first (shared keys), then apps/server/.env so
-// server-scoped values win if the same key is defined in both.
-dotenv.config({ path: path.resolve(__dirname, '../../../.env') });
-dotenv.config({ path: path.resolve(__dirname, '../.env'), override: true });
 
 import { DaytonaDeployer, DaytonaDeploymentError } from './DaytonaDeployer';
 import { SandboxRecorder } from './SandboxRecorder';
@@ -24,6 +21,8 @@ import { PipelineOrchestrator } from './PipelineOrchestrator';
 import { STAGE_DEFS, type StageId } from './pipelineStages';
 import { PROVIDERS } from './llm/providers';
 import { validateLlmKey, type LlmConfig } from './llm/createLlmClient';
+import { requireUser, supabaseAdmin, isSupabaseConfigured, type AuthedRequest } from './auth/supabaseAuth';
+import { UsageLimiter, UsageLimitError } from './usage/UsageLimiter';
 
 const app: Express = express();
 const PORT = process.env.PORT || 3001;
@@ -78,6 +77,33 @@ const orchestrator = audioGenerator
     })
   : null;
 
+// Auth: every protected route requires a valid Supabase access token.
+const auth = requireUser();
+
+// Per-user daily cap on owner-cost actions (voiceover + sandbox recording).
+const RUN_LIMIT_PER_DAY = Number.parseInt(process.env.RUN_LIMIT_PER_DAY ?? '5', 10) || 5;
+const usageLimiter = supabaseAdmin ? new UsageLimiter(supabaseAdmin, RUN_LIMIT_PER_DAY) : null;
+
+/**
+ * Check + record one owner-cost run for the requesting user. Returns true if
+ * the caller may proceed; on the daily cap it responds 429 and returns false.
+ */
+async function enforceLimit(req: AuthedRequest, res: Response, kind: string): Promise<boolean> {
+  if (!usageLimiter || !req.user) return true; // unreachable behind `auth`, but fail-open here
+  try {
+    await usageLimiter.consume(req.user.id, kind);
+    return true;
+  } catch (e) {
+    if (e instanceof UsageLimitError) {
+      res.status(429).json({ error: e.message, code: 'RATE_LIMITED', limit: e.limit, used: e.used });
+      return false;
+    }
+    console.error('usage check failed:', e);
+    res.status(500).json({ error: 'Usage check failed.', code: 'USAGE_CHECK_FAILED' });
+    return false;
+  }
+}
+
 type DeployRequestBody = {
   githubUrl?: string;
   branch?: string;
@@ -115,7 +141,7 @@ app.get('/api/hello', (_req: Request, res: Response) => {
   res.json({ message: 'Hello from the server!' });
 });
 
-app.post('/api/record', async (req: Request, res: Response) => {
+app.post('/api/record', auth, async (req: Request, res: Response) => {
   const {
     url,
     githubUrl,
@@ -128,6 +154,8 @@ app.post('/api/record', async (req: Request, res: Response) => {
     appStartCommand,
     appBuildCommand,
   } = req.body as RecordRequestBody;
+
+  if (!(await enforceLimit(req as AuthedRequest, res, 'record'))) return;
 
   if (githubUrl && typeof githubUrl === 'string') {
     if (!sandboxRecorder) {
@@ -197,7 +225,7 @@ app.post('/api/record', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/deploy', async (req: Request, res: Response) => {
+app.post('/api/deploy', auth, async (req: Request, res: Response) => {
   const { githubUrl, branch, commitId, workspaceDir, skipSetup } = req.body as DeployRequestBody;
 
   if (!githubUrl || typeof githubUrl !== 'string') {
@@ -210,6 +238,8 @@ app.post('/api/deploy', async (req: Request, res: Response) => {
     res.status(503).json({ error: 'Daytona is not configured (set DAYTONA_API_KEY).', code: 'DAYTONA_UNAVAILABLE' });
     return;
   }
+
+  if (!(await enforceLimit(req as AuthedRequest, res, 'deploy'))) return;
 
   try {
     const deployment = await daytonaDeployer.deployFromGithub({
@@ -243,7 +273,8 @@ type TestAudioRequest = {
   voiceId?: string;
 };
 
-app.post('/api/test/audio', async (req: Request, res: Response) => {
+app.post('/api/test/audio', auth, async (req: Request, res: Response) => {
+  if (!(await enforceLimit(req as AuthedRequest, res, 'test-audio'))) return;
   if (!audioGenerator) {
     res.status(503).json({
       error: 'ELEVENLABS_API_KEY is not configured. Add it to .env and restart the server.',
@@ -288,7 +319,7 @@ app.post('/api/test/audio', async (req: Request, res: Response) => {
 // All endpoints assume a single Express process and an in-memory SessionStore.
 // Sessions live ~2 hours by default and are evicted by SessionStore's sweeper.
 
-app.post('/api/pipeline/start', (req: Request, res: Response) => {
+app.post('/api/pipeline/start', auth, (req: Request, res: Response) => {
   if (!orchestrator) {
     res.status(503).json({
       error: 'Pipeline unavailable. ELEVENLABS_API_KEY must be set on the server; an LLM key can be brought per-request or set as ANTHROPIC_API_KEY.',
@@ -383,7 +414,7 @@ app.post('/api/validate-key', async (req: Request, res: Response) => {
   res.status(result.ok ? 200 : 200).json(result);
 });
 
-app.get('/api/pipeline/:id/status', (req: Request, res: Response) => {
+app.get('/api/pipeline/:id/status', auth, (req: Request, res: Response) => {
   const session = sessionStore.get(req.params.id);
   if (!session) {
     res.status(404).json({ error: 'Session not found' });
@@ -392,7 +423,7 @@ app.get('/api/pipeline/:id/status', (req: Request, res: Response) => {
   res.json(redactSession(session));
 });
 
-app.post('/api/pipeline/:id/feedback', async (req: Request, res: Response) => {
+app.post('/api/pipeline/:id/feedback', auth, async (req: Request, res: Response) => {
   if (!orchestrator) {
     res.status(503).json({ error: 'Pipeline unavailable.', code: 'PIPELINE_UNAVAILABLE' });
     return;
@@ -410,11 +441,14 @@ app.post('/api/pipeline/:id/feedback', async (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/pipeline/:id/approve', (req: Request, res: Response) => {
+app.post('/api/pipeline/:id/approve', auth, async (req: Request, res: Response) => {
   if (!orchestrator) {
     res.status(503).json({ error: 'Pipeline unavailable.', code: 'PIPELINE_UNAVAILABLE' });
     return;
   }
+  // Approve kicks off the owner-cost media stage (voiceover + recording), so
+  // this is where the per-user daily cap is enforced.
+  if (!(await enforceLimit(req as AuthedRequest, res, 'approve'))) return;
   const { skipRecording } = (req.body ?? {}) as { skipRecording?: boolean };
   try {
     const session = orchestrator.approve(req.params.id, { skipRecording: skipRecording === true });
@@ -424,7 +458,7 @@ app.post('/api/pipeline/:id/approve', (req: Request, res: Response) => {
   }
 });
 
-app.get('/api/pipeline/:id/result', (req: Request, res: Response) => {
+app.get('/api/pipeline/:id/result', auth, (req: Request, res: Response) => {
   const session = sessionStore.get(req.params.id);
   if (!session) {
     res.status(404).json({ error: 'Session not found' });
@@ -442,7 +476,7 @@ app.get('/api/pipeline/:id/result', (req: Request, res: Response) => {
   });
 });
 
-app.post('/api/pipeline/:id/reiterate', (req: Request, res: Response) => {
+app.post('/api/pipeline/:id/reiterate', auth, (req: Request, res: Response) => {
   if (!orchestrator) {
     res.status(503).json({ error: 'Pipeline unavailable.', code: 'PIPELINE_UNAVAILABLE' });
     return;
@@ -473,6 +507,11 @@ app.listen(PORT, () => {
   }
   if (!orchestrator) {
     console.warn('⚠️  Full pipeline disabled — ELEVENLABS_API_KEY is required (LLM key can be brought per-request).');
+  }
+  if (!isSupabaseConfigured) {
+    console.warn('⚠️  Supabase not configured (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY). Protected routes will return 503.');
+  } else {
+    console.log(`🔐 Auth on. Per-user cap: ${RUN_LIMIT_PER_DAY} owner-cost runs/day.`);
   }
 });
 

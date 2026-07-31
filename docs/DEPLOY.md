@@ -4,6 +4,26 @@ Two pieces: the **web app** (Next.js → Vercel) and the **server** (Express +
 ffmpeg + Puppeteer + Daytona → a container host). See
 [ADR 0004](adr/0004-media-storage-and-hosting.md) for the rationale.
 
+## 0. Supabase (auth + usage limits)
+
+Sign-in and the per-user run cap are backed by Supabase (see
+[ADR 0005](adr/0005-auth-and-usage-limits.md)). Set this up first.
+
+1. Create a project at [supabase.com](https://supabase.com). From
+   **Settings → API** copy: the **Project URL**, the **anon / publishable**
+   key (browser-safe), and the **service_role / secret** key (server-only).
+2. In **SQL Editor → New query**, paste and run [`supabase/schema.sql`](../supabase/schema.sql)
+   to create the `pipeline_runs` table.
+3. (Optional) enable **GitHub** under **Authentication → Providers** if you want
+   the "Continue with GitHub" button; add the callback
+   `https://<your-web-domain>/auth/callback`.
+4. For a smooth demo you can turn **off** email confirmation under
+   **Authentication → Providers → Email** (otherwise new sign-ups must confirm
+   via email before they can sign in).
+
+⚠️ The **service_role / secret** key must only ever live in the **server** env.
+Never put it in a `NEXT_PUBLIC_*` variable — those ship to every browser.
+
 ## 1. Server (container host: Render / Railway / Fly)
 
 The server can't run on serverless — it needs ffmpeg, a real Chromium, and
@@ -26,6 +46,9 @@ docker run --rm -p 3001:3001 \
 | Var | Required | Purpose |
 |---|---|---|
 | `ELEVENLABS_API_KEY` | **yes** | Voiceover. The pipeline is disabled without it. |
+| `SUPABASE_URL` | **yes** | Supabase project URL — required for auth + usage limits. |
+| `SUPABASE_SERVICE_ROLE_KEY` | **yes** | Supabase service_role/secret key. Server-only — protected routes return 503 without it. |
+| `RUN_LIMIT_PER_DAY` | no | Owner-cost runs per user per day. Defaults to 5. |
 | `ANTHROPIC_API_KEY` | optional | Server-default LLM. Users can bring their own key per run instead. |
 | `DAYTONA_API_KEY` | for repo recording | Sandboxed recording of GitHub repos. |
 | `CORS_ORIGIN` | prod | Comma-separated allowed web origin(s). Lock to your Vercel domain. |
@@ -46,8 +69,10 @@ docker run --rm -p 3001:3001 \
 
 - Project root: `apps/web` (or set the Vercel "Root Directory" to `apps/web`).
 - Build command: `next build` (default). Output: `.next`.
-- Env var: `NEXT_PUBLIC_SERVER_BASE=https://your-server.onrender.com` (the
-  deployed server URL).
+- Env vars:
+  - `NEXT_PUBLIC_SERVER_BASE=https://your-server.onrender.com` (the deployed server URL)
+  - `NEXT_PUBLIC_SUPABASE_URL=https://<ref>.supabase.co`
+  - `NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon / publishable key>` (browser-safe; never the service_role key)
 - Redeploy after the server URL is known.
 
 ## 3. Smoke test the deployment

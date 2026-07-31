@@ -1,8 +1,23 @@
 'use client';
 
 import { useState } from 'react';
+import { createClient } from '@/lib/supabase/client';
 
 const SERVER_BASE = process.env.NEXT_PUBLIC_SERVER_BASE || 'http://localhost:3001';
+
+let _supabase: ReturnType<typeof createClient> | null = null;
+function sb() {
+  return (_supabase ??= createClient());
+}
+
+/** fetch() with the Supabase access token attached; the server verifies it. */
+async function authFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  const { data } = await sb().auth.getSession();
+  const token = data.session?.access_token;
+  const headers = new Headers(init.headers);
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  return fetch(input, { ...init, headers });
+}
 
 const SAMPLE_PROMPTS = [
   {
@@ -76,7 +91,7 @@ function ScriptCard() {
     setLoading(true);
     setError(null);
     try {
-      const r = await fetch(`${SERVER_BASE}/api/test/script`, {
+      const r = await authFetch(`${SERVER_BASE}/api/test/script`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ userPrompt, projectContext, targetDurationSec }),
@@ -191,7 +206,7 @@ function AudioCard() {
     setLoading(true);
     setError(null);
     try {
-      const r = await fetch(`${SERVER_BASE}/api/test/audio`, {
+      const r = await authFetch(`${SERVER_BASE}/api/test/audio`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ text, voiceId: voiceId || undefined }),
