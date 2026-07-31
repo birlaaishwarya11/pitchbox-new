@@ -1,0 +1,49 @@
+# Render Blueprint for the Pitchbox server.
+#
+# The server can't run on serverless — it needs ffmpeg, a real Chromium, and
+# long-running jobs — so this is a Docker web service built from the repo-root
+# Dockerfile. See docs/DEPLOY.md for the full walkthrough.
+#
+# NOTE ON THE FREE PLAN: free instances have no persistent disk and 512MB RAM.
+# MEDIA_DIR is therefore left unset so generated media lands in the container's
+# ./recordings, which is wiped on every restart/redeploy. Free instances also
+# sleep after ~15 minutes idle. Upgrade to `starter` and attach a disk (see the
+# commented-out block below) before treating this as anything but a demo.
+services:
+  - type: web
+    name: pitchbox-server
+    runtime: docker
+    plan: free
+    region: virginia
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+
+    envVars:
+      # Voiceover. The pipeline is disabled without it.
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      # Auth + usage limits. Protected routes return 503 until both are set.
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # Server-default LLM. Users can bring their own key per run instead.
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # Required for sandboxed recording of GitHub repos. Without it, repo
+      # recording would have to run untrusted code on the host — don't.
+      - key: DAYTONA_API_KEY
+        sync: false
+      # Lock to the deployed web origin once Vercel has assigned the domain.
+      - key: CORS_ORIGIN
+        sync: false
+      - key: RUN_LIMIT_PER_DAY
+        value: "5"
+
+    # Paid plans only — free instances cannot mount a disk.
+    # disk:
+    #   name: pitchbox-media
+    #   mountPath: /data
+    #   sizeGB: 5
+    # (and add an envVar MEDIA_DIR=/data so videos survive restarts)
