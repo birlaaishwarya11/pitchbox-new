@@ -146,6 +146,9 @@ export default function PipelinePage() {
 
   // Bring-your-own LLM config (null = use the server default, if any).
   const [llm, setLlm] = useState<LlmCfg | null>(null);
+  // Bring-your-own ElevenLabs key. Kept in component state only, never written
+  // to localStorage — same treatment as the LLM key.
+  const [elevenLabsKey, setElevenLabsKey] = useState('');
 
   // Feedback box
   const [feedback, setFeedback] = useState('');
@@ -201,6 +204,7 @@ export default function PipelinePage() {
           selectedStages: selectedStageIds(),
           skipRecording: !recordSelected,
           llm: llm ?? undefined,
+          elevenLabsApiKey: elevenLabsKey.trim() || undefined,
         }),
       });
       const data = await r.json();
@@ -316,6 +320,8 @@ export default function PipelinePage() {
             selectedOptional={selectedOptional}
             toggleOptional={toggleOptional}
             onLlmChange={setLlm}
+            elevenLabsKey={elevenLabsKey}
+            setElevenLabsKey={setElevenLabsKey}
             onStart={handleStart}
           />
         )}
@@ -394,6 +400,8 @@ function InputCard(props: {
   selectedOptional: Set<StageId>;
   toggleOptional: (id: StageId) => void;
   onLlmChange: (llm: LlmCfg | null) => void;
+  elevenLabsKey: string;
+  setElevenLabsKey: (v: string) => void;
   onStart: () => void;
 }) {
   const analyzeOn = props.selectedOptional.has('analyze');
@@ -484,6 +492,9 @@ function InputCard(props: {
       {/* Model provider (bring your own key). */}
       <ProviderConfig onChange={props.onLlmChange} />
 
+      {/* Voiceover key (bring your own). Sent per-run and never stored. */}
+      <VoiceConfig value={props.elevenLabsKey} onChange={props.setElevenLabsKey} />
+
       {/* Stage-selection panel: pick which agents run before launch. */}
       <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3 space-y-2">
         <p className="text-xs uppercase tracking-widest text-zinc-500">Stages to run</p>
@@ -532,6 +543,53 @@ function InputCard(props: {
 }
 
 const CUSTOM_MODEL = '__custom__';
+
+/**
+ * Bring-your-own ElevenLabs key for the voiceover.
+ *
+ * Held in React state and sent with the run — deliberately never persisted to
+ * localStorage, matching how the LLM key is handled: a key in localStorage
+ * outlives the session and is readable by any script on the page.
+ */
+function VoiceConfig({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [hasServerAudio, setHasServerAudio] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    fetch(`${SERVER_BASE}/api/providers`)
+      .then((r) => r.json())
+      .then((d) => setHasServerAudio(!!d.hasServerAudio))
+      .catch(() => setHasServerAudio(false));
+  }, []);
+
+  return (
+    <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <p className="text-xs uppercase tracking-widest text-zinc-500">Voiceover key</p>
+        <a
+          href="https://elevenlabs.io"
+          target="_blank"
+          rel="noreferrer"
+          className="text-[10px] text-indigo-400 underline"
+        >
+          Get an ElevenLabs key
+        </a>
+      </div>
+      <input
+        type="password"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="ElevenLabs API key"
+        className="w-full rounded border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-600"
+      />
+      {hasServerAudio === false && !value.trim() && (
+        <p className="text-[11px] text-amber-400">
+          Required — this server has no voice key of its own, so the run will fail without yours.
+        </p>
+      )}
+      <p className="text-[10px] text-zinc-600">Used for this run only. Never stored, never logged.</p>
+    </div>
+  );
+}
 
 function ProviderConfig({ onChange }: { onChange: (llm: LlmCfg | null) => void }) {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);

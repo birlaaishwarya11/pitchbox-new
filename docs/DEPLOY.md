@@ -33,28 +33,43 @@ long-running jobs. A `Dockerfile` is at the repo root.
 ```bash
 docker build -t pitchbox-server .
 docker run --rm -p 3001:3001 \
-  -e ELEVENLABS_API_KEY=... \
-  -e ANTHROPIC_API_KEY=...        # optional: server default LLM (users can BYO) \
+  -e SUPABASE_URL=... \
+  -e SUPABASE_SERVICE_ROLE_KEY=... \
   -e DAYTONA_API_KEY=...          # required for repo (sandbox) recording \
   -e CORS_ORIGIN=https://your-web.vercel.app \
   -e MEDIA_DIR=/data \
   -v pitchbox-media:/data \
   pitchbox-server
+
+# Self-hosting and want the server's own LLM/voice keys used as a fallback?
+# Add: -e PITCHBOX_ALLOW_SERVER_KEYS=true -e ANTHROPIC_API_KEY=... -e ELEVENLABS_API_KEY=...
 ```
 
 ### Environment variables
 | Var | Required | Purpose |
 |---|---|---|
-| `ELEVENLABS_API_KEY` | **yes** | Voiceover. The pipeline is disabled without it. |
 | `SUPABASE_URL` | **yes** | Supabase project URL — required for auth + usage limits. |
 | `SUPABASE_SERVICE_ROLE_KEY` | **yes** | Supabase service_role/secret key. Server-only — protected routes return 503 without it. |
-| `RUN_LIMIT_PER_DAY` | no | Owner-cost runs per user per day. Defaults to 5. |
-| `ANTHROPIC_API_KEY` | optional | Server-default LLM. Users can bring their own key per run instead. |
-| `DAYTONA_API_KEY` | for repo recording | Sandboxed recording of GitHub repos. |
+| `DAYTONA_API_KEY` | for repo recording | Sandboxed recording of GitHub repos. The operator's only per-run cost. |
+| `RUN_LIMIT_PER_DAY` | no | **Daytona-backed** runs per user per day. Defaults to 5. Voiceover/LLM are uncapped. |
 | `CORS_ORIGIN` | prod | Comma-separated allowed web origin(s). Lock to your Vercel domain. |
 | `MEDIA_DIR` | prod | Path for generated media; point at a **mounted persistent volume**. |
 | `PORT` | no | Defaults to 3001. |
+| `PITCHBOX_ALLOW_SERVER_KEYS` | **leave unset in prod** | See below. |
+| `ANTHROPIC_API_KEY`, `ELEVENLABS_API_KEY` | self-host only | Ignored unless the flag above is `true`. |
 | `VOICE_ID`, `BLOB_READ_WRITE_TOKEN` | optional | Override ElevenLabs voice / future blob mirror. |
+
+### Bring-your-own-keys (important)
+
+Pitchbox is BYOK by default: every run supplies its own LLM and ElevenLabs key,
+so a public deployment costs you nothing but Daytona. `ANTHROPIC_API_KEY` and
+`ELEVENLABS_API_KEY` are **ignored** unless `PITCHBOX_ALLOW_SERVER_KEYS=true`.
+
+Leave that flag unset on any deployment strangers can reach. It is opt-in
+precisely so that forgetting it is free — the opposite default would quietly
+fund every visitor. Self-hosters set it to `true` to use env keys as before.
+
+See [ADR 0006](adr/0006-headless-access-byok-and-usage-telemetry.md).
 
 ### Host notes
 - **Render:** Web Service from the Dockerfile; add a **Disk** mounted at `/data`
@@ -78,12 +93,36 @@ docker run --rm -p 3001:3001 \
 ## 3. Smoke test the deployment
 ```bash
 curl https://your-server.example.com/health           # {"status":"ok"}
-curl https://your-server.example.com/api/providers     # provider list
+curl https://your-server.example.com/api/providers     # providers + capabilities
 ```
-Then open the Vercel URL → **Launch the pipeline** → run a no-recording job
-(uses the server default key) and confirm you get a final MP4.
+`/api/providers` also reports `hasServerAudio` and `hasSandboxRecording`. On a
+correctly configured public deployment `hasServerAudio` and `hasServerDefault`
+should both be **false** — if either is true, you are paying for your users.
 
-## 4. Security note
+Then open the Vercel URL → **Launch the pipeline** → paste your own LLM and
+ElevenLabs keys → run a no-recording job and confirm you get a final MP4.
+
+## 4. Headless access (MCP)
+
+Users can drive Pitchbox from Claude Code / Claude Desktop instead of the web UI.
+They generate an API key at `/settings/keys` and configure the MCP server in
+[`skills/pitchbox/INSTALL.md`](../skills/pitchbox/INSTALL.md).
+
+Nothing extra to deploy — the MCP server runs on the user's machine and talks to
+this same HTTP API. Just make sure `CORS_ORIGIN` does not block it: CORS applies
+to browsers only, so MCP traffic is unaffected.
+
+## 5. Usage telemetry
+
+The server records a usage event per action into `usage_events`: what ran, when,
+web vs MCP, provider/model, outcome, and a **SHA-256 hash** of the repo/target
+URL. Prompts, scripts and API keys are never stored.
+
+Recording happens server-side deliberately — this repo is public, so telemetry
+in the MCP client could simply be removed by a forker. See
+[ADR 0006](adr/0006-headless-access-byok-and-usage-telemetry.md).
+
+## 6. Security note
 Recording a **GitHub repo** builds and runs untrusted code — this happens
 **only** inside a Daytona sandbox, never on the server host. Recording a
 **public URL** just visits the page with headless Chromium on the host, which is
