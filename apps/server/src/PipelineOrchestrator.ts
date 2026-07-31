@@ -5,7 +5,7 @@ import { Planner } from './Planner';
 import { Researcher } from './Researcher';
 import { Scripter } from './Scripter';
 import { createLlmClient, type LlmConfig } from './llm/createLlmClient';
-import type { AudioGenerator } from './AudioGenerator';
+import { AudioGenerator } from './AudioGenerator';
 import type { Fuser } from './Fuser';
 import type { RepositoryCloner } from './RepositoryCloner';
 import type { CodebaseAnalyzer, AnalysisResult } from './CodebaseAnalyzer';
@@ -22,13 +22,19 @@ interface SessionAgents {
   planner: Planner;
   researcher: Researcher;
   scripter: Scripter;
+  // Bound per session: voiceover is billed to whoever's ElevenLabs key ran it,
+  // so the generator cannot be shared across users the way a stateless helper
+  // like Fuser can.
+  audioGenerator: AudioGenerator;
 }
 
 export interface PipelineDeps {
   store: SessionStore;
   // Operator fallback LLM config (from server env) when a request brings no key.
   defaultLlm?: LlmConfig;
-  audioGenerator: AudioGenerator;
+  // Operator fallback voice generator. Optional: a bring-your-own-keys
+  // deployment sets no ElevenLabs key at all, and every run supplies its own.
+  audioGenerator?: AudioGenerator;
   fuser: Fuser;
   repositoryCloner?: RepositoryCloner;
   codebaseAnalyzer?: CodebaseAnalyzer;
@@ -63,6 +69,10 @@ export interface StartInput {
   // Bring-your-own LLM: provider + key + model. Falls back to the operator's
   // default config when omitted.
   llm?: LlmConfig;
+  // Bring-your-own ElevenLabs key for voiceover. Falls back to the operator's
+  // generator when omitted — which a BYOK deployment does not configure, so
+  // omitting both is a clear error rather than a silent charge to the operator.
+  elevenLabsApiKey?: string;
 }
 
 export class PipelineOrchestrator {
@@ -71,12 +81,13 @@ export class PipelineOrchestrator {
 
   constructor(private readonly deps: PipelineDeps) {}
 
-  private buildAgents(llm: LlmConfig): SessionAgents {
+  private buildAgents(llm: LlmConfig, audioGenerator: AudioGenerator): SessionAgents {
     const client = createLlmClient(llm);
     return {
       planner: new Planner(client),
       researcher: new Researcher(client),
       scripter: new Scripter(client),
+      audioGenerator,
     };
   }
 
@@ -87,8 +98,16 @@ export class PipelineOrchestrator {
     if (!llm) {
       throw new Error('No LLM configured. Provide an API key (provider + model), or set a server default.');
     }
+    // Voiceover is the one owner-cost stage, so resolve its key up front and
+    // fail loudly rather than starting a run that dies at the media stage.
+    const audioGenerator = input.elevenLabsApiKey
+      ? new AudioGenerator(input.elevenLabsApiKey)
+      : this.deps.audioGenerator;
+    if (!audioGenerator) {
+      throw new Error('No ElevenLabs key configured. Provide `elevenLabsApiKey` to generate the voiceover.');
+    }
     // Build eagerly so an invalid provider/model fails fast with a clear error.
-    const agents = this.buildAgents(llm);
+    const agents = this.buildAgents(llm, audioGenerator);
 
     const session = this.deps.store.create(
       {
@@ -291,7 +310,12 @@ export class PipelineOrchestrator {
 
     // 1. Audio + (optional) video in parallel.
     store.setStage(sessionId, 'voiceover', { status: 'running' });
-    const audioPromise = this.deps.audioGenerator
+    // The run's own generator, built from whichever ElevenLabs key started it.
+    const audioGenerator = this.agentsBySession.get(sessionId)?.audioGenerator;
+    if (!audioGenerator) {
+      throw new Error('This session has expired (server restarted). Start a new one.');
+    }
+    const audioPromise = audioGenerator
       .generate(approvedScript.fullScript, { outputDir: sessionDir })
       .then((res) => {
         store.update(sessionId, (s) => {

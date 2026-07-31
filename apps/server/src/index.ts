@@ -23,6 +23,8 @@ import { PROVIDERS } from './llm/providers';
 import { validateLlmKey, type LlmConfig } from './llm/createLlmClient';
 import { requireUser, supabaseAdmin, isSupabaseConfigured, type AuthedRequest } from './auth/supabaseAuth';
 import { UsageLimiter, UsageLimitError } from './usage/UsageLimiter';
+import { TelemetryRecorder } from './usage/TelemetryRecorder';
+import { mintApiKey } from './auth/apiKeys';
 
 const app: Express = express();
 const PORT = process.env.PORT || 3001;
@@ -30,9 +32,26 @@ const recorder = new Recorder();
 const repositoryCloner = new RepositoryCloner();
 const codebaseAnalyzer = new CodebaseAnalyzer();
 const flowExtractor = new FlowExtractor();
-const audioGenerator = process.env.ELEVENLABS_API_KEY && !process.env.ELEVENLABS_API_KEY.includes('ADD YOUR')
-  ? new AudioGenerator(process.env.ELEVENLABS_API_KEY)
-  : null;
+
+/**
+ * Bring-your-own-keys switch.
+ *
+ * The hosted deployment must never spend the operator's LLM or voice credits on
+ * strangers' runs, so server-side ANTHROPIC_API_KEY / ELEVENLABS_API_KEY are
+ * IGNORED unless this is explicitly turned on. Self-hosters flip it to true and
+ * get the old convenience of env keys back.
+ *
+ * Opt-in rather than opt-out on purpose: forgetting to set a variable then
+ * costs nothing, whereas forgetting to unset one would quietly fund everybody.
+ */
+const ALLOW_SERVER_KEYS = process.env.PITCHBOX_ALLOW_SERVER_KEYS === 'true';
+
+const serverElevenLabsKey =
+  ALLOW_SERVER_KEYS && process.env.ELEVENLABS_API_KEY && !process.env.ELEVENLABS_API_KEY.includes('ADD YOUR')
+    ? process.env.ELEVENLABS_API_KEY
+    : undefined;
+
+const audioGenerator = serverElevenLabsKey ? new AudioGenerator(serverElevenLabsKey) : null;
 
 // Media output dir. Override with MEDIA_DIR in production to point at a mounted
 // persistent volume so generated videos survive restarts/redeploys.
@@ -45,11 +64,12 @@ const SESSIONS_DIR = path.join(MEDIA_DIR, 'sessions');
 const sessionStore = new SessionStore(SESSIONS_DIR);
 sessionStore.start();
 
-// Operator fallback LLM config: used when a request brings no key. Users can
-// override per-run with their own provider + key + model (BYO).
-const defaultLlm: LlmConfig | undefined = process.env.ANTHROPIC_API_KEY
-  ? { provider: 'anthropic', apiKey: process.env.ANTHROPIC_API_KEY, model: 'claude-opus-4-8' }
-  : undefined;
+// Operator fallback LLM config: used when a request brings no key. Gated on
+// ALLOW_SERVER_KEYS so the hosted instance is bring-your-own-key only.
+const defaultLlm: LlmConfig | undefined =
+  ALLOW_SERVER_KEYS && process.env.ANTHROPIC_API_KEY
+    ? { provider: 'anthropic', apiKey: process.env.ANTHROPIC_API_KEY, model: 'claude-opus-4-8' }
+    : undefined;
 
 // Daytona sandbox — isolated execution for recording untrusted GitHub repos
 // (building/running a stranger's code must never happen on the host). Created
@@ -59,28 +79,47 @@ const daytonaDeployer: DaytonaDeployer | null = process.env.DAYTONA_API_KEY
   : null;
 const sandboxRecorder: SandboxRecorder | null = daytonaDeployer ? new SandboxRecorder(daytonaDeployer) : null;
 
-const orchestrator = audioGenerator
-  ? new PipelineOrchestrator({
-      store: sessionStore,
-      defaultLlm,
-      audioGenerator,
-      fuser: new Fuser(),
-      slateRenderer: new SlateRenderer(),
-      repositoryCloner,
-      codebaseAnalyzer,
-      flowExtractor,
-      // Records a deployed/public URL directly (no Daytona required).
-      urlRecorder: recorder,
-      // Records a GitHub repo by building + running it inside a Daytona sandbox.
-      sandboxRecorder: sandboxRecorder ?? undefined,
-      publicMediaPrefix: '/sessions',
-    })
-  : null;
+// Always constructed now: with bring-your-own-keys, a run supplies its own LLM
+// and ElevenLabs credentials, so the pipeline is available even when the server
+// itself holds no keys at all.
+const orchestrator = new PipelineOrchestrator({
+  store: sessionStore,
+  defaultLlm,
+  audioGenerator: audioGenerator ?? undefined,
+  fuser: new Fuser(),
+  slateRenderer: new SlateRenderer(),
+  repositoryCloner,
+  codebaseAnalyzer,
+  flowExtractor,
+  // Records a deployed/public URL directly (no Daytona required).
+  urlRecorder: recorder,
+  // Records a GitHub repo by building + running it inside a Daytona sandbox.
+  sandboxRecorder: sandboxRecorder ?? undefined,
+  publicMediaPrefix: '/sessions',
+});
 
-// Auth: every protected route requires a valid Supabase access token.
+// Auth: accepts a Supabase session token (web) or a `pbx_live_…` API key (MCP).
 const auth = requireUser();
+// Key management must never be reachable with an API key — see requireUser.
+const authJwtOnly = requireUser({ jwtOnly: true });
 
-// Per-user daily cap on owner-cost actions (voiceover + sandbox recording).
+// Usage heartbeat. Null when Supabase is unconfigured; recording is always
+// best-effort and never blocks a request.
+const telemetry = supabaseAdmin ? new TelemetryRecorder(supabaseAdmin) : null;
+
+/** Client identification headers sent by the MCP server (untrusted; labels only). */
+function clientInfo(req: Request): { client?: string; clientVersion?: string } {
+  const client = req.headers['x-pitchbox-client'];
+  const version = req.headers['x-pitchbox-client-version'];
+  return {
+    client: typeof client === 'string' ? client.slice(0, 64) : undefined,
+    clientVersion: typeof version === 'string' ? version.slice(0, 32) : undefined,
+  };
+}
+
+// Per-user daily cap. Since Phase 6 this guards ONLY Daytona-backed actions
+// (sandbox recording + deploy) — the operator's remaining cost. Voiceover and
+// LLM calls are billed to the user's own keys, so they are not capped.
 const RUN_LIMIT_PER_DAY = Number.parseInt(process.env.RUN_LIMIT_PER_DAY ?? '5', 10) || 5;
 const usageLimiter = supabaseAdmin ? new UsageLimiter(supabaseAdmin, RUN_LIMIT_PER_DAY) : null;
 
@@ -155,9 +194,22 @@ app.post('/api/record', auth, async (req: Request, res: Response) => {
     appBuildCommand,
   } = req.body as RecordRequestBody;
 
-  if (!(await enforceLimit(req as AuthedRequest, res, 'record'))) return;
+  const authed = req as AuthedRequest;
+  telemetry?.record({
+    userId: authed.user!.id,
+    apiKeyId: authed.apiKeyId,
+    event: 'record',
+    surface: authed.authSurface,
+    ...clientInfo(req),
+    target: githubUrl || url,
+    targetKind: githubUrl ? 'repo' : url ? 'url' : undefined,
+  });
 
   if (githubUrl && typeof githubUrl === 'string') {
+    // Only the repo path spends a Daytona sandbox, so only it is capped.
+    // Recording a plain URL runs on this host with Puppeteer and costs nothing
+    // metered.
+    if (!(await enforceLimit(authed, res, 'record'))) return;
     if (!sandboxRecorder) {
       res.status(503).json({ error: 'Daytona is not configured (set DAYTONA_API_KEY).', code: 'DAYTONA_UNAVAILABLE' });
       return;
@@ -239,7 +291,19 @@ app.post('/api/deploy', auth, async (req: Request, res: Response) => {
     return;
   }
 
+  // Deploy always spends a Daytona sandbox — the operator's cost, so capped.
   if (!(await enforceLimit(req as AuthedRequest, res, 'deploy'))) return;
+
+  const authedDeploy = req as AuthedRequest;
+  telemetry?.record({
+    userId: authedDeploy.user!.id,
+    apiKeyId: authedDeploy.apiKeyId,
+    event: 'deploy',
+    surface: authedDeploy.authSurface,
+    ...clientInfo(req),
+    target: githubUrl,
+    targetKind: 'repo',
+  });
 
   try {
     const deployment = await daytonaDeployer.deployFromGithub({
@@ -271,26 +335,47 @@ app.post('/api/deploy', auth, async (req: Request, res: Response) => {
 type TestAudioRequest = {
   text?: string;
   voiceId?: string;
+  /** Bring-your-own ElevenLabs key. Used for this request only, never stored. */
+  elevenLabsApiKey?: string;
 };
 
 app.post('/api/test/audio', auth, async (req: Request, res: Response) => {
-  if (!(await enforceLimit(req as AuthedRequest, res, 'test-audio'))) return;
-  if (!audioGenerator) {
-    res.status(503).json({
-      error: 'ELEVENLABS_API_KEY is not configured. Add it to .env and restart the server.',
-      code: 'ELEVENLABS_NOT_CONFIGURED',
+  // No daily cap here: the voiceover is billed to the caller's own ElevenLabs
+  // key, so it costs the operator nothing.
+  const { text, voiceId, elevenLabsApiKey } = req.body as TestAudioRequest;
+
+  // Bring-your-own key wins; the server generator exists only when a
+  // self-hoster set PITCHBOX_ALLOW_SERVER_KEYS.
+  const generator =
+    typeof elevenLabsApiKey === 'string' && elevenLabsApiKey.trim()
+      ? new AudioGenerator(elevenLabsApiKey.trim())
+      : audioGenerator;
+
+  if (!generator) {
+    res.status(400).json({
+      error: 'No ElevenLabs key. Send `elevenLabsApiKey` with this request (get one at https://elevenlabs.io).',
+      code: 'ELEVENLABS_KEY_REQUIRED',
     });
     return;
   }
 
-  const { text, voiceId } = req.body as TestAudioRequest;
   if (!text || typeof text !== 'string' || !text.trim()) {
     res.status(400).json({ error: 'A `text` field is required.' });
     return;
   }
 
+  const authed = req as AuthedRequest;
+  telemetry?.record({
+    userId: authed.user!.id,
+    apiKeyId: authed.apiKeyId,
+    event: 'test-audio',
+    surface: authed.authSurface,
+    ...clientInfo(req),
+    byoAudio: !!elevenLabsApiKey,
+  });
+
   try {
-    const result = await audioGenerator.generate(text.trim(), {
+    const result = await generator.generate(text.trim(), {
       voiceId: typeof voiceId === 'string' && voiceId.trim().length > 0 ? voiceId.trim() : undefined,
       outputDir: TEST_AUDIO_DIR,
     });
@@ -320,13 +405,6 @@ app.post('/api/test/audio', auth, async (req: Request, res: Response) => {
 // Sessions live ~2 hours by default and are evicted by SessionStore's sweeper.
 
 app.post('/api/pipeline/start', auth, (req: Request, res: Response) => {
-  if (!orchestrator) {
-    res.status(503).json({
-      error: 'Pipeline unavailable. ELEVENLABS_API_KEY must be set on the server; an LLM key can be brought per-request or set as ANTHROPIC_API_KEY.',
-      code: 'PIPELINE_UNAVAILABLE',
-    });
-    return;
-  }
   const {
     githubUrl,
     branch,
@@ -339,6 +417,7 @@ app.post('/api/pipeline/start', auth, (req: Request, res: Response) => {
     selectedStages,
     skipRecording,
     llm,
+    elevenLabsApiKey,
   } = (req.body ?? {}) as {
     githubUrl?: string;
     branch?: string;
@@ -351,6 +430,7 @@ app.post('/api/pipeline/start', auth, (req: Request, res: Response) => {
     selectedStages?: string[];
     skipRecording?: boolean;
     llm?: { provider?: string; apiKey?: string; model?: string };
+    elevenLabsApiKey?: string;
   };
 
   if (!userPrompt || typeof userPrompt !== 'string' || !userPrompt.trim()) {
@@ -363,6 +443,9 @@ app.post('/api/pipeline/start', auth, (req: Request, res: Response) => {
     llm && llm.provider && llm.apiKey && llm.model
       ? { provider: llm.provider, apiKey: llm.apiKey, model: llm.model }
       : undefined;
+
+  const audioKey =
+    typeof elevenLabsApiKey === 'string' && elevenLabsApiKey.trim() ? elevenLabsApiKey.trim() : undefined;
 
   try {
     const session = orchestrator.start({
@@ -378,10 +461,44 @@ app.post('/api/pipeline/start', auth, (req: Request, res: Response) => {
       selectedStages: Array.isArray(selectedStages) ? (selectedStages as StageId[]) : undefined,
       skipRecording: skipRecording === true,
       llm: llmConfig,
+      elevenLabsApiKey: audioKey,
     });
+
+    // Heartbeat: what was built, on what, with which provider — no prompt text,
+    // and the target only as a hash (see TelemetryRecorder).
+    const authed = req as AuthedRequest;
+    const target = githubUrl?.trim() || recordUrl?.trim();
+    telemetry?.record({
+      userId: authed.user!.id,
+      apiKeyId: authed.apiKeyId,
+      event: 'pipeline.start',
+      surface: authed.authSurface,
+      ...clientInfo(req),
+      provider: llmConfig?.provider ?? defaultLlm?.provider,
+      model: llmConfig?.model ?? defaultLlm?.model,
+      byoLlm: !!llmConfig,
+      byoAudio: !!audioKey,
+      target,
+      targetKind: githubUrl?.trim() ? 'repo' : recordUrl?.trim() ? 'url' : undefined,
+      stages: Array.isArray(selectedStages) ? selectedStages : undefined,
+      skipRecording: skipRecording === true,
+      status: 'ok',
+    });
+
     res.status(202).json({ sessionId: session.id, status: session.status });
   } catch (e) {
-    res.status(400).json({ error: e instanceof Error ? e.message : String(e), code: 'LLM_CONFIG_INVALID' });
+    const message = e instanceof Error ? e.message : String(e);
+    const authed = req as AuthedRequest;
+    telemetry?.record({
+      userId: authed.user!.id,
+      apiKeyId: authed.apiKeyId,
+      event: 'pipeline.error',
+      surface: authed.authSurface,
+      ...clientInfo(req),
+      status: 'error',
+      errorCode: 'START_REJECTED',
+    });
+    res.status(400).json({ error: message, code: 'LLM_CONFIG_INVALID' });
   }
 });
 
@@ -400,7 +517,86 @@ app.get('/api/providers', (_req: Request, res: Response) => {
       models: p.models,
     })),
     hasServerDefault: !!defaultLlm,
+    // False on the hosted instance: users must bring an ElevenLabs key. The UI
+    // uses this to decide whether the key field is required or optional.
+    hasServerAudio: !!audioGenerator,
+    // Whether repo (Daytona) recording is available at all on this instance.
+    hasSandboxRecording: !!sandboxRecorder,
   });
+});
+
+// --- API keys (headless access) -------------------------------------------
+// `authJwtOnly`: reachable only with a browser session. An API key must not be
+// able to mint or revoke keys, or a single leaked key would be self-renewing.
+
+app.get('/api/keys', authJwtOnly, async (req: Request, res: Response) => {
+  if (!supabaseAdmin) {
+    res.status(503).json({ error: 'Supabase is not configured.', code: 'AUTH_UNAVAILABLE' });
+    return;
+  }
+  const authed = req as AuthedRequest;
+  const { data, error } = await supabaseAdmin
+    .from('api_keys')
+    .select('id, name, prefix, created_at, last_used_at, revoked_at')
+    .eq('user_id', authed.user!.id)
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    res.status(500).json({ error: 'Could not list keys.', code: 'KEY_LIST_FAILED' });
+    return;
+  }
+  res.json({ keys: data ?? [] });
+});
+
+app.post('/api/keys', authJwtOnly, async (req: Request, res: Response) => {
+  if (!supabaseAdmin) {
+    res.status(503).json({ error: 'Supabase is not configured.', code: 'AUTH_UNAVAILABLE' });
+    return;
+  }
+  const { name } = (req.body ?? {}) as { name?: string };
+  const authed = req as AuthedRequest;
+  const minted = mintApiKey();
+
+  const { data, error } = await supabaseAdmin
+    .from('api_keys')
+    .insert({
+      user_id: authed.user!.id,
+      name: typeof name === 'string' && name.trim() ? name.trim().slice(0, 64) : 'MCP key',
+      key_hash: minted.hash,
+      prefix: minted.prefix,
+    })
+    .select('id, name, prefix, created_at')
+    .single();
+
+  if (error || !data) {
+    res.status(500).json({ error: 'Could not create key.', code: 'KEY_CREATE_FAILED' });
+    return;
+  }
+
+  // The only time the plaintext ever leaves the server. It is not stored, so it
+  // cannot be shown again — the UI must make that clear to the user.
+  res.status(201).json({ ...data, key: minted.plaintext });
+});
+
+app.delete('/api/keys/:id', authJwtOnly, async (req: Request, res: Response) => {
+  if (!supabaseAdmin) {
+    res.status(503).json({ error: 'Supabase is not configured.', code: 'AUTH_UNAVAILABLE' });
+    return;
+  }
+  const authed = req as AuthedRequest;
+  // Revoked, not deleted: usage_events reference the key, and the history of
+  // what a key did is worth more than the row it occupies.
+  const { error } = await supabaseAdmin
+    .from('api_keys')
+    .update({ revoked_at: new Date().toISOString() })
+    .eq('id', req.params.id)
+    .eq('user_id', authed.user!.id); // scoping to the owner prevents revoking someone else's key
+
+  if (error) {
+    res.status(500).json({ error: 'Could not revoke key.', code: 'KEY_REVOKE_FAILED' });
+    return;
+  }
+  res.json({ status: 'revoked' });
 });
 
 // Validate a key + model with a tiny live request, mapping errors to clear text.
@@ -424,10 +620,6 @@ app.get('/api/pipeline/:id/status', auth, (req: Request, res: Response) => {
 });
 
 app.post('/api/pipeline/:id/feedback', auth, async (req: Request, res: Response) => {
-  if (!orchestrator) {
-    res.status(503).json({ error: 'Pipeline unavailable.', code: 'PIPELINE_UNAVAILABLE' });
-    return;
-  }
   const { feedback } = (req.body ?? {}) as { feedback?: string };
   if (!feedback || typeof feedback !== 'string' || !feedback.trim()) {
     res.status(400).json({ error: 'A `feedback` field is required.' });
@@ -442,16 +634,29 @@ app.post('/api/pipeline/:id/feedback', auth, async (req: Request, res: Response)
 });
 
 app.post('/api/pipeline/:id/approve', auth, async (req: Request, res: Response) => {
-  if (!orchestrator) {
-    res.status(503).json({ error: 'Pipeline unavailable.', code: 'PIPELINE_UNAVAILABLE' });
-    return;
-  }
-  // Approve kicks off the owner-cost media stage (voiceover + recording), so
-  // this is where the per-user daily cap is enforced.
-  if (!(await enforceLimit(req as AuthedRequest, res, 'approve'))) return;
   const { skipRecording } = (req.body ?? {}) as { skipRecording?: boolean };
+  const existing = sessionStore.get(req.params.id);
+
+  // Approve starts the media stage. Voiceover is billed to the caller's own
+  // ElevenLabs key, so the only operator cost left is a Daytona sandbox — which
+  // is used solely to record a GitHub repo. Cap that case and nothing else.
+  const willUseSandbox = !!existing?.input.githubUrl && skipRecording !== true;
+  if (willUseSandbox && !(await enforceLimit(req as AuthedRequest, res, 'approve'))) return;
+
   try {
     const session = orchestrator.approve(req.params.id, { skipRecording: skipRecording === true });
+    const authed = req as AuthedRequest;
+    telemetry?.record({
+      userId: authed.user!.id,
+      apiKeyId: authed.apiKeyId,
+      event: 'pipeline.complete',
+      surface: authed.authSurface,
+      ...clientInfo(req),
+      target: existing?.input.githubUrl || existing?.input.recordUrl,
+      targetKind: existing?.input.githubUrl ? 'repo' : existing?.input.recordUrl ? 'url' : undefined,
+      skipRecording: skipRecording === true,
+      status: 'ok',
+    });
     res.status(202).json(redactSession(session));
   } catch (e) {
     res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
@@ -477,10 +682,6 @@ app.get('/api/pipeline/:id/result', auth, (req: Request, res: Response) => {
 });
 
 app.post('/api/pipeline/:id/reiterate', auth, (req: Request, res: Response) => {
-  if (!orchestrator) {
-    res.status(503).json({ error: 'Pipeline unavailable.', code: 'PIPELINE_UNAVAILABLE' });
-    return;
-  }
   try {
     const session = orchestrator.reiterate(req.params.id);
     res.json(redactSession(session));
@@ -499,19 +700,29 @@ function redactSession(session: ReturnType<SessionStore['get']>) {
 
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on http://localhost:${PORT}`);
-  if (!process.env.ANTHROPIC_API_KEY) {
-    console.warn('⚠️  ANTHROPIC_API_KEY not configured. Script generation will be unavailable.');
+
+  if (ALLOW_SERVER_KEYS) {
+    console.log('🔓 PITCHBOX_ALLOW_SERVER_KEYS=true — server env keys are in use (self-host mode).');
+    if (!process.env.ANTHROPIC_API_KEY) {
+      console.warn('⚠️  ANTHROPIC_API_KEY not set. Runs must bring their own LLM key.');
+    }
+    if (!audioGenerator) {
+      console.warn('⚠️  ELEVENLABS_API_KEY not set. Runs must bring their own voice key.');
+    }
+  } else {
+    console.log('🔑 Bring-your-own-keys mode: every run supplies its own LLM + ElevenLabs key.');
+    if (process.env.ANTHROPIC_API_KEY || process.env.ELEVENLABS_API_KEY) {
+      console.warn('⚠️  Server LLM/voice keys are present but IGNORED (set PITCHBOX_ALLOW_SERVER_KEYS=true to use them).');
+    }
   }
-  if (!audioGenerator) {
-    console.warn('⚠️  ELEVENLABS_API_KEY not configured. Audio generation will be unavailable.');
-  }
-  if (!orchestrator) {
-    console.warn('⚠️  Full pipeline disabled — ELEVENLABS_API_KEY is required (LLM key can be brought per-request).');
+
+  if (!sandboxRecorder) {
+    console.warn('⚠️  DAYTONA_API_KEY not set. Recording a GitHub repo will be unavailable.');
   }
   if (!isSupabaseConfigured) {
     console.warn('⚠️  Supabase not configured (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY). Protected routes will return 503.');
   } else {
-    console.log(`🔐 Auth on. Per-user cap: ${RUN_LIMIT_PER_DAY} owner-cost runs/day.`);
+    console.log(`🔐 Auth on (session or API key). Daytona-backed cap: ${RUN_LIMIT_PER_DAY} runs/day.`);
   }
 });
 
