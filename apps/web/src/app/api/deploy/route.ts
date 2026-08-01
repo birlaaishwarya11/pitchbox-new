@@ -28,8 +28,12 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: 'GitHub URL is required' }, { status: 400 });
   }
 
+  // Must be the ORIGIN, never the public base. NEXT_PUBLIC_SERVER_BASE now
+  // points at this very deployment (Vercel proxies /api to the server), so
+  // using it here would make this handler call itself and recurse until the
+  // abort below fired.
   const serverUrl =
-    process.env.NEXT_PUBLIC_SERVER_BASE || process.env.NEXT_PUBLIC_SERVER_URL || DEFAULT_SERVER_URL;
+    process.env.PITCHBOX_SERVER_ORIGIN || process.env.NEXT_PUBLIC_SERVER_URL || DEFAULT_SERVER_URL;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
 
