@@ -31,7 +31,7 @@ export class Scripter {
     try {
       const text = await this.client.chat({
         system: SYSTEM,
-        maxTokens: 2048,
+        maxTokens: 8192,
         user: buildUserMessage(input),
       });
 

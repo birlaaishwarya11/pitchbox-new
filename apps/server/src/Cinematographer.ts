@@ -83,7 +83,7 @@ export class Cinematographer {
 
     const text = await this.client.chat({
       system: SYSTEM,
-      maxTokens: 2048,
+      maxTokens: 8192,
       user: [
         `# Video duration`,
         `${Math.round(input.durationSec)} seconds — shots must cover 0 to ${Math.round(input.durationSec)}.`,

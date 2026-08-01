@@ -35,7 +35,20 @@ export class AnthropicClient implements LlmClient {
         .filter((b): b is Anthropic.TextBlock => b.type === 'text')
         .map((b) => b.text)
         .join('');
-      if (!text.trim()) throw new LlmError('unknown', 'Empty response from Anthropic.');
+      if (!text.trim()) {
+        // Current models think by default, and max_tokens caps thinking AND
+        // text together — so a budget sized for the answer alone comes back
+        // empty with stop_reason 'max_tokens'. Say that, rather than the
+        // useless 'empty response' this used to report.
+        if (res.stop_reason === 'max_tokens') {
+          throw new LlmError(
+            'bad_request',
+            `The model used its entire ${input.maxTokens}-token budget on reasoning and returned no text. ` +
+              'Raise maxTokens for this stage.',
+          );
+        }
+        throw new LlmError('unknown', 'Empty response from Anthropic.');
+      }
       return text;
     } catch (err) {
       throw toLlmError(err);

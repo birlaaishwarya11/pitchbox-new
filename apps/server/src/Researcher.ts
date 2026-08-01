@@ -21,7 +21,7 @@ export class Researcher {
     try {
       const text = await this.client.chat({
         system: SYSTEM,
-        maxTokens: 1500,
+        maxTokens: 4096,
         user: buildUserMessage(input),
       });
       const json = parseJsonObject(text);

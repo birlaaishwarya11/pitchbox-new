@@ -327,6 +327,9 @@ export class Recorder {
     let browser: Browser | undefined;
     let capturing = false;
     let watchdog: NodeJS.Timeout | undefined;
+    // Measured so the finished file can be retimed to real time — see below.
+    let capturedMs = 0;
+    let capturedFrames = 0;
 
     try {
       ffmpegProcess = this.spawnFfmpegImagePipe(tmpOutput);
@@ -371,6 +374,9 @@ export class Recorder {
 
       capturing = true;
       const frameIntervalMs = Math.max(1, Math.floor(1000 / this.ffmpeg.frameRate));
+      // Real capture rate is measured, not assumed — see the retime below.
+      const captureStartedAt = Date.now();
+      let frameCount = 0;
 
       // Hard cap on the whole capture. A busy SPA renderer can make a single
       // page.screenshot() block with no timeout, which would stall the loop
@@ -419,6 +425,7 @@ export class Recorder {
         }
 
         if (!ffmpegStdin.writable) break;
+        frameCount += 1;
         const ok = ffmpegStdin.write(frame);
         if (!ok) {
           await new Promise<void>((resolve) => ffmpegStdin.once('drain', () => resolve()));
@@ -449,6 +456,8 @@ export class Recorder {
 
       capturing = false;
       if (watchdog) clearTimeout(watchdog);
+      capturedMs = Date.now() - captureStartedAt;
+      capturedFrames = frameCount;
       ffmpegStdin.end();
 
       // The watchdog may have already closed the browser; close() is safe to
@@ -458,6 +467,8 @@ export class Recorder {
 
       await this.waitForClose(ffmpegProcess);
       ffmpegProcess = undefined;
+
+      await this.retimeToRealTime(tmpOutput, capturedFrames, capturedMs);
     } finally {
       capturing = false;
       if (watchdog) clearTimeout(watchdog);
@@ -467,6 +478,49 @@ export class Recorder {
       if (browser) {
         await browser.close().catch(() => undefined);
       }
+    }
+  }
+
+  /**
+   * Stretch the captured file so playback matches the time it actually took.
+   *
+   * Frames are piped to ffmpeg labelled at `frameRate`, but a headless
+   * screenshot loop cannot hit 30fps — with zoom transitions it manages around
+   * 20. ffmpeg honours the label, so 89 seconds of capture became a 58-second
+   * file: the motion played fast and every recording came out short of the
+   * narration, which the fuser then papered over by looping.
+   *
+   * Rescaling the container timestamps is a stream copy — no re-encode, no
+   * quality loss, and the motion plays at the speed it was captured.
+   */
+  private async retimeToRealTime(filePath: string, frames: number, elapsedMs: number): Promise<void> {
+    if (frames < 2 || elapsedMs < 1_000) return;
+    const actualFps = frames / (elapsedMs / 1000);
+    const scale = this.ffmpeg.frameRate / actualFps;
+    // Under ~5% off is not worth a remux.
+    if (!Number.isFinite(scale) || Math.abs(scale - 1) < 0.05) return;
+
+    const retimed = `${filePath}.retimed.mp4`;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const proc = spawn('ffmpeg', [
+          '-y',
+          '-loglevel', 'error',
+          // Scales input timestamps; with -c copy this is a fast remux.
+          '-itsscale', scale.toFixed(6),
+          '-i', filePath,
+          '-c', 'copy',
+          retimed,
+        ]);
+        proc.on('error', reject);
+        proc.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`ffmpeg retime exited ${code}`))));
+      });
+      await rename(retimed, filePath);
+      console.log(`[recorder] retimed capture: ${actualFps.toFixed(1)}fps actual -> ${(elapsedMs / 1000).toFixed(1)}s`);
+    } catch (err) {
+      // A failed retime leaves the original (short) file, which still works.
+      console.warn('[recorder] retime failed, keeping original timing:', err);
+      await rm(retimed, { force: true }).catch(() => undefined);
     }
   }
 

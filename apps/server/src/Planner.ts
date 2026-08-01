@@ -24,7 +24,7 @@ export class Planner {
     try {
       const text = await this.client.chat({
         system: SYSTEM,
-        maxTokens: 1024,
+        maxTokens: 4096,
         user: [
           `# User purpose / instructions`,
           input.userPrompt.trim(),
