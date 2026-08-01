@@ -50,7 +50,7 @@ claude mcp add pitchbox \
   --env PITCHBOX_SERVER_BASE=https://3.90.117.18.sslip.io \
   --env PITCHBOX_LLM_PROVIDER=anthropic \
   --env PITCHBOX_LLM_KEY=sk-ant-xxx \
-  --env PITCHBOX_LLM_MODEL=claude-sonnet-4-6 \
+  --env PITCHBOX_LLM_MODEL=claude-sonnet-5 \
   --env ELEVENLABS_API_KEY=xxx \
   -- node /absolute/path/to/pitchbox-new/apps/mcp/dist/index.js
 ```
@@ -71,7 +71,7 @@ Edit `claude_desktop_config.json` (macOS:
         "PITCHBOX_SERVER_BASE": "https://3.90.117.18.sslip.io",
         "PITCHBOX_LLM_PROVIDER": "anthropic",
         "PITCHBOX_LLM_KEY": "sk-ant-xxx",
-        "PITCHBOX_LLM_MODEL": "claude-sonnet-4-6",
+        "PITCHBOX_LLM_MODEL": "claude-sonnet-5",
         "ELEVENLABS_API_KEY": "xxx"
       }
     }
@@ -90,7 +90,7 @@ from your project directory.
 | `PITCHBOX_SERVER_BASE` | **yes** in practice | Pitchbox server URL. Defaults to `http://localhost:3001` |
 | `PITCHBOX_LLM_PROVIDER` | yes* | `anthropic`, `openai`, `google`, `groq`, `mistral`, `openrouter` |
 | `PITCHBOX_LLM_KEY` | yes* | Your provider key |
-| `PITCHBOX_LLM_MODEL` | yes* | Exact model id, e.g. `claude-sonnet-4-6` |
+| `PITCHBOX_LLM_MODEL` | yes* | Exact model id, e.g. `claude-sonnet-5` |
 | `ELEVENLABS_API_KEY` | yes* | Voiceover |
 
 \* Required unless the server is self-hosted with `PITCHBOX_ALLOW_SERVER_KEYS=true`.

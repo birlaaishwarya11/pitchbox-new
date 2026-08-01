@@ -78,7 +78,7 @@ sessionStore.start();
 // ALLOW_SERVER_KEYS so the hosted instance is bring-your-own-key only.
 const defaultLlm: LlmConfig | undefined =
   ALLOW_SERVER_KEYS && process.env.ANTHROPIC_API_KEY
-    ? { provider: 'anthropic', apiKey: process.env.ANTHROPIC_API_KEY, model: 'claude-opus-4-8' }
+    ? { provider: 'anthropic', apiKey: process.env.ANTHROPIC_API_KEY, model: 'claude-sonnet-5' }
     : undefined;
 
 // Daytona sandbox — isolated execution for recording untrusted GitHub repos

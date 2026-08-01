@@ -30,10 +30,14 @@ export const PROVIDERS: ProviderDef[] = [
     label: 'Anthropic (Claude)',
     adapter: 'anthropic',
     keysUrl: 'https://console.anthropic.com/settings/keys',
+    // Current generation. Opus 5 is a drop-in successor to Opus 4.8 at the same
+    // price; Sonnet 5 reaches near-Opus quality on this kind of work for a
+    // fifth of the cost, which makes it the sensible default for a scripting
+    // pipeline. Haiku stays for anyone optimising purely for spend.
     models: [
-      { id: 'claude-opus-4-8', label: 'Claude Opus 4.8' },
-      { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
-      { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5' },
+      { id: 'claude-sonnet-5', label: 'Claude Sonnet 5 (recommended)' },
+      { id: 'claude-opus-5', label: 'Claude Opus 5 (most capable)' },
+      { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5 (cheapest)' },
     ],
   },
   {
