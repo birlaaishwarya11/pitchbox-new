@@ -349,6 +349,15 @@ export class Recorder {
       let shots: Shot[] = [];
       if (planShots) {
         try {
+          // tsx/esbuild wraps transpiled functions with a `__name` helper to
+          // preserve Function.prototype.name. page.evaluate() ships the
+          // function's *source* to the browser, where that helper doesn't
+          // exist — so every camera call died with "__name is not defined" and
+          // silently fell back to scrolling. Define a no-op shim first.
+          // Passed as a string on purpose: string arguments aren't transpiled,
+          // so this one line can't itself depend on the helper it installs.
+          await page.evaluate('globalThis.__name = globalThis.__name || ((fn) => fn)');
+
           const targets = await page.evaluate(harvestTargets);
           if (targets.length) {
             shots = await planShots(targets);
