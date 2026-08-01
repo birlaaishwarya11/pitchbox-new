@@ -14,6 +14,7 @@ import type { SandboxRecorder } from './SandboxRecorder';
 import type { Recorder } from './Recorder';
 import type { SlateRenderer } from './SlateRenderer';
 import { resolveSelectedStages, type StageId } from './pipelineStages';
+import { mediaSemaphore } from './concurrency';
 
 // Recording is the flakiest stage; total attempts = 1 try + (this - 1) retries.
 const RECORD_MAX_ATTEMPTS = 2;
@@ -301,7 +302,29 @@ export class PipelineOrchestrator {
     // Status is already SCRIPT_DRAFT after appendScriptVersion.
   }
 
+  /**
+   * Gate on the media semaphore, then run the real work.
+   *
+   * The wait happens here rather than at the HTTP layer so approve() still
+   * returns immediately and the UI keeps showing progress — the run simply sits
+   * in 'GENERATING' until a slot frees, instead of failing outright.
+   */
   private async runMediaStages(
+    sessionId: string,
+    approvedScript: ScriptVersion,
+    options: { skipRecording?: boolean },
+  ): Promise<void> {
+    const release = await mediaSemaphore.acquire();
+    const { active, queued } = mediaSemaphore.stats;
+    if (queued > 0) console.log(`[pipeline ${sessionId}] media slot acquired (${active} active, ${queued} queued)`);
+    try {
+      await this.runMediaStagesInner(sessionId, approvedScript, options);
+    } finally {
+      release();
+    }
+  }
+
+  private async runMediaStagesInner(
     sessionId: string,
     approvedScript: ScriptVersion,
     options: { skipRecording?: boolean },
