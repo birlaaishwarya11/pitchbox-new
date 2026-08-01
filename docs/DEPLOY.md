@@ -159,7 +159,26 @@ Recording happens server-side deliberately — this repo is public, so telemetry
 in the MCP client could simply be removed by a forker. See
 [ADR 0006](adr/0006-headless-access-byok-and-usage-telemetry.md).
 
-## 6. Security note
+## 6. Limits that protect your bill
+
+Two different mechanisms, often confused:
+
+| Control | Bounds | Why |
+|---|---|---|
+| `RUN_LIMIT_PER_DAY` (5) | One user's Daytona runs per day | Fairness between users |
+| `RUN_LIMIT_GLOBAL_PER_DAY` (50) | **Your total spend** per day | Signup is open — the per-user cap limits an *account*, not the bill |
+| `RATE_LIMIT_*` | Request bursts | Stops loops and scripted abuse |
+| `MAX_LIVE_SESSIONS` (200) | Memory | Each session holds a plan + every script version |
+
+If you publicise the link, **`RUN_LIMIT_GLOBAL_PER_DAY` is the number to think
+hardest about.** Anyone can register, so without it a determined visitor can
+create accounts until your Daytona credits are gone. Set it to what you are
+actually willing to pay for in a day.
+
+Voiceover and LLM calls are uncapped on purpose — those run on the user's own
+keys and cost you nothing.
+
+## 7. Security note
 Recording a **GitHub repo** builds and runs untrusted code — this happens
 **only** inside a Daytona sandbox, never on the server host. Recording a
 **public URL** just visits the page with headless Chromium on the host, which is
