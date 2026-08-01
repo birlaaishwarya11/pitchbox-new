@@ -3,7 +3,12 @@ import { NextResponse, type NextRequest } from 'next/server';
 
 // Routes that require a signed-in user. Everything else (landing, /login,
 // /auth/callback, static assets) stays public.
-const PROTECTED_PREFIXES = ['/pipeline', '/test'];
+//
+// /settings is here because the API-key page is useless without a session (its
+// requests 401) and shipping a broken-looking page is worse than redirecting to
+// sign-in. The server is the real gate — these routes only decide what the
+// browser bothers rendering.
+const PROTECTED_PREFIXES = ['/pipeline', '/test', '/settings'];
 
 /**
  * Refreshes the Supabase session on every request (keeps the auth cookie
