@@ -1,4 +1,4 @@
-import { CLIENT_NAME, CLIENT_VERSION, type PitchboxConfig } from './config';
+import { CLIENT_NAME, CLIENT_VERSION, type PitchboxConfig } from './config.js';
 
 /**
  * Thin HTTP client for the Pitchbox REST API.

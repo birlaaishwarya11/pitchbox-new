@@ -2,8 +2,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { CLIENT_NAME, CLIENT_VERSION, ConfigError, loadConfig } from './config';
-import { PitchboxApiError, PitchboxClient } from './pitchboxClient';
+import { CLIENT_NAME, CLIENT_VERSION, ConfigError, loadConfig } from './config.js';
+import { PitchboxApiError, PitchboxClient } from './pitchboxClient.js';
 
 /**
  * Pitchbox as an MCP server: generate a product demo video from an editor or

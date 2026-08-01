@@ -2,8 +2,13 @@
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2022"],
-    "module": "ES2022",
-    "moduleResolution": "bundler",
+    // NodeNext, not bundler: nothing bundles this — Node runs dist/ directly, so
+    // relative imports need explicit .js extensions. `bundler` accepts
+    // extensionless imports and emits them unchanged, which typechecks cleanly
+    // and then throws ERR_MODULE_NOT_FOUND at runtime. NodeNext makes that a
+    // compile error instead.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
     "outDir": "dist",
     "rootDir": "src",
     "strict": true,
