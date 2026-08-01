@@ -110,11 +110,24 @@ async function runImageSlate(imagePath: string, audioPath: string, outputPath: s
 }
 
 async function runMux(videoPath: string, audioPath: string, outputPath: string): Promise<void> {
-  // Re-encode audio to AAC (ffmpeg defaults), copy video stream. -shortest cuts at the
-  // shorter of the two, which is usually correct for demo videos where the recording
-  // and the voiceover are independently captured. Adjust if you want loop-video-on-long-vo.
+  // The recording and the voiceover are captured independently and rarely match
+  // in length. `-shortest` alone truncates to whichever is shorter, and since a
+  // screen capture usually finishes before the narration does, that silently
+  // cut the voiceover off mid-sentence — the video looked fine and the script
+  // was simply missing its ending.
+  //
+  // The narration is the content, so audio length wins. When the video is
+  // shorter it loops to cover the difference; `-shortest` then trims the loop
+  // at the moment the audio ends.
+  const videoMs = await ffprobeDurationMs(videoPath);
+  const audioMs = await ffprobeDurationMs(audioPath);
+  // Half a second of slack: a trivial difference is not worth re-encoding for.
+  const needsLoop = videoMs > 0 && audioMs > videoMs + 500;
+
   const args = [
     '-y',
+    // -stream_loop applies to the input that follows it.
+    ...(needsLoop ? ['-stream_loop', '-1'] : []),
     '-i',
     videoPath,
     '-i',
@@ -123,8 +136,9 @@ async function runMux(videoPath: string, audioPath: string, outputPath: string):
     '0:v:0',
     '-map',
     '1:a:0',
-    '-c:v',
-    'copy',
+    // Looping a copied stream produces broken timestamps, so re-encode in that
+    // case only; the straightforward path still just copies the video.
+    ...(needsLoop ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p'] : ['-c:v', 'copy']),
     '-c:a',
     'aac',
     '-b:a',
