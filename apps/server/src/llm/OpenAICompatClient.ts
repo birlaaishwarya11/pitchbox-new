@@ -1,5 +1,5 @@
-import type { ChatInput, LlmClient } from './LlmClient';
-import { LlmError, llmErrorFromStatus } from './LlmClient';
+import type { ChatInput, LlmClient, LlmUsage } from './LlmClient';
+import { LlmError, llmErrorFromStatus, parseRetryAfter, withRetry } from './LlmClient';
 
 /**
  * Adapter for any provider that implements the OpenAI `chat/completions` API
@@ -15,7 +15,13 @@ export class OpenAICompatClient implements LlmClient {
     public readonly model: string,
   ) {}
 
-  async chat(input: ChatInput): Promise<string> {
+  readonly usage: LlmUsage = { inputTokens: 0, outputTokens: 0, calls: 0 };
+
+  chat(input: ChatInput): Promise<string> {
+    return withRetry(() => this.chatOnce(input), { label: `${this.providerId}/${this.model}` });
+  }
+
+  private async chatOnce(input: ChatInput): Promise<string> {
     const url = `${this.baseUrl.replace(/\/$/, '')}/chat/completions`;
     let res: Response;
     try {
@@ -49,7 +55,12 @@ export class OpenAICompatClient implements LlmClient {
       } catch {
         providerMessage = await res.text().catch(() => undefined);
       }
-      throw llmErrorFromStatus(res.status, providerMessage);
+      const mapped = llmErrorFromStatus(res.status, providerMessage);
+      // Free tiers send Retry-After on 429 — respecting it beats guessing.
+      const retryAfter = parseRetryAfter(res.headers.get('retry-after'));
+      throw retryAfter === undefined
+        ? mapped
+        : new LlmError(mapped.kind, mapped.message, mapped.status, mapped.cause, retryAfter);
     }
 
     let body: any;
@@ -58,6 +69,10 @@ export class OpenAICompatClient implements LlmClient {
     } catch (err) {
       throw new LlmError('unknown', `${this.providerLabel} returned a non-JSON response.`, res.status, err);
     }
+    this.usage.calls += 1;
+    this.usage.inputTokens += body?.usage?.prompt_tokens ?? 0;
+    this.usage.outputTokens += body?.usage?.completion_tokens ?? 0;
+
     const text: string | undefined = body?.choices?.[0]?.message?.content;
     if (!text || !text.trim()) {
       throw new LlmError('unknown', `${this.providerLabel} returned an empty response.`, res.status);

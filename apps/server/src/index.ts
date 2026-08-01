@@ -89,6 +89,10 @@ const daytonaDeployer: DaytonaDeployer | null = process.env.DAYTONA_API_KEY
   : null;
 const sandboxRecorder: SandboxRecorder | null = daytonaDeployer ? new SandboxRecorder(daytonaDeployer) : null;
 
+// Usage heartbeat. Null when Supabase is unconfigured; recording is always
+// best-effort and never blocks a request.
+const telemetry = supabaseAdmin ? new TelemetryRecorder(supabaseAdmin) : null;
+
 // Always constructed now: with bring-your-own-keys, a run supplies its own LLM
 // and ElevenLabs credentials, so the pipeline is available even when the server
 // itself holds no keys at all.
@@ -106,6 +110,21 @@ const orchestrator = new PipelineOrchestrator({
   // Records a GitHub repo by building + running it inside a Daytona sandbox.
   sandboxRecorder: sandboxRecorder ?? undefined,
   publicMediaPrefix: '/sessions',
+  // Fires when a run actually finishes, which is the only point where the token
+  // totals include every stage (the cinematographer runs after approval).
+  onSessionComplete: (session, usage) => {
+    telemetry?.record({
+      userId: session.userId,
+      event: 'pipeline.complete',
+      target: session.input.githubUrl || session.input.recordUrl,
+      targetKind: session.input.githubUrl ? 'repo' : session.input.recordUrl ? 'url' : undefined,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
+      llmCalls: usage.calls,
+      durationMs: Date.parse(session.updatedAt) - Date.parse(session.createdAt),
+      status: 'ok',
+    });
+  },
 });
 
 // Auth: accepts a Supabase session token (web) or a `pbx_live_…` API key (MCP).
@@ -113,9 +132,6 @@ const auth = requireUser();
 // Key management must never be reachable with an API key — see requireUser.
 const authJwtOnly = requireUser({ jwtOnly: true });
 
-// Usage heartbeat. Null when Supabase is unconfigured; recording is always
-// best-effort and never blocks a request.
-const telemetry = supabaseAdmin ? new TelemetryRecorder(supabaseAdmin) : null;
 
 /** Client identification headers sent by the MCP server (untrusted; labels only). */
 function clientInfo(req: Request): { client?: string; clientVersion?: string } {
@@ -734,7 +750,7 @@ app.post('/api/pipeline/:id/approve', auth, async (req: Request, res: Response) 
     telemetry?.record({
       userId: authed.user!.id,
       apiKeyId: authed.apiKeyId,
-      event: 'pipeline.complete',
+      event: 'pipeline.approve',
       surface: authed.authSurface,
       ...clientInfo(req),
       target: existing?.input.githubUrl || existing?.input.recordUrl,

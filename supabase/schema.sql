@@ -94,6 +94,12 @@ create table if not exists public.usage_events (
   stages         text[],                      -- selected pipeline stages
   skip_recording boolean,
   duration_ms    integer,
+
+  -- Token cost of the run. Recorded on the completion event so it includes the
+  -- cinematographer, which plans camera moves after the script is approved.
+  input_tokens   integer,
+  output_tokens  integer,
+  llm_calls      integer,
   status         text,                        -- 'ok' | 'error'
   error_code     text,
 

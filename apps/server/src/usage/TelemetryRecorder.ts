@@ -20,6 +20,7 @@ import type { AuthSurface } from '../auth/supabaseAuth';
 
 export type UsageEventName =
   | 'pipeline.start'
+  | 'pipeline.approve'
   | 'pipeline.complete'
   | 'pipeline.error'
   | 'record'
@@ -45,6 +46,10 @@ export interface UsageEventInput {
   durationMs?: number;
   status?: 'ok' | 'error';
   errorCode?: string;
+  /** Token totals for the run, known only once every stage has finished. */
+  inputTokens?: number;
+  outputTokens?: number;
+  llmCalls?: number;
 }
 
 /**
@@ -88,6 +93,9 @@ export class TelemetryRecorder {
       duration_ms: input.durationMs ?? null,
       status: input.status ?? null,
       error_code: input.errorCode ?? null,
+      input_tokens: input.inputTokens ?? null,
+      output_tokens: input.outputTokens ?? null,
+      llm_calls: input.llmCalls ?? null,
     };
 
     void this.supabase

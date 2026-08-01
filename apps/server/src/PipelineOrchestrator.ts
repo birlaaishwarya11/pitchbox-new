@@ -7,6 +7,7 @@ import { Researcher } from './Researcher';
 import { Scripter } from './Scripter';
 import { Cinematographer } from './Cinematographer';
 import { createLlmClient, type LlmConfig } from './llm/createLlmClient';
+import type { LlmClient } from './llm/LlmClient';
 import { AudioGenerator } from './AudioGenerator';
 import type { Fuser } from './Fuser';
 import type { RepositoryCloner } from './RepositoryCloner';
@@ -44,6 +45,8 @@ interface SessionAgents {
   scripter: Scripter;
   // Plans the camera moves over the recording, on the run's own LLM key.
   cinematographer: Cinematographer;
+  // The shared client behind all four agents — carries this run's token totals.
+  llmClient: LlmClient;
   // Bound per session: voiceover is billed to whoever's ElevenLabs key ran it,
   // so the generator cannot be shared across users the way a stateless helper
   // like Fuser can.
@@ -70,6 +73,14 @@ export interface PipelineDeps {
   // Public URL prefix for static-served session files. Final URLs become
   // `${publicMediaPrefix}/${sessionId}/<file>`.
   publicMediaPrefix: string;
+  /**
+   * Fired once a session reaches READY.
+   *
+   * Token totals are only complete here: the cinematographer plans camera moves
+   * during recording, i.e. after approval, so anything recorded at approve time
+   * would undercount the run.
+   */
+  onSessionComplete?: (session: PipelineSession, usage: { inputTokens: number; outputTokens: number; calls: number }) => void;
 }
 
 export interface StartInput {
@@ -112,6 +123,7 @@ export class PipelineOrchestrator {
       researcher: new Researcher(client),
       scripter: new Scripter(client),
       cinematographer: new Cinematographer(client),
+      llmClient: client,
       audioGenerator,
     };
   }
@@ -453,6 +465,17 @@ export class PipelineOrchestrator {
       s.status = 'READY';
     });
     store.setStage(sessionId, 'fuse', { status: 'done', message: video ? 'with screen capture' : 'slate' });
+
+    const finished = store.get(sessionId);
+    const usage = this.agentsBySession.get(sessionId)?.llmClient.usage;
+    if (finished && usage) {
+      try {
+        this.deps.onSessionComplete?.(finished, { ...usage });
+      } catch (err) {
+        // Telemetry must never fail a finished run.
+        console.warn(`[pipeline ${sessionId}] completion hook failed:`, err);
+      }
+    }
   }
 
   /**
