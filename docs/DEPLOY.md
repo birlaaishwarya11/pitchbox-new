@@ -4,6 +4,43 @@ Two pieces: the **web app** (Next.js → Vercel) and the **server** (Express +
 ffmpeg + Puppeteer + Daytona → a container host). See
 [ADR 0004](adr/0004-media-storage-and-hosting.md) for the rationale.
 
+## Current deployment
+
+| Piece | Where |
+|---|---|
+| Web | Vercel — <https://pitchbox-gold.vercel.app> |
+| Server | AWS EC2 `t3.small` (us-east-1), Elastic IP `3.90.117.18` |
+| Server URL | <https://3.90.117.18.sslip.io> |
+| Auth + usage | Supabase project `ebztagjgciwxwqavafte` |
+
+The server runs two containers on a user-defined Docker network: the app itself,
+and Caddy terminating TLS. There is no domain — `sslip.io` resolves
+`<ip>.sslip.io` to `<ip>`, which is enough for Let's Encrypt to issue a real
+certificate. HTTPS is not optional here: the Vercel front end is HTTPS and
+browsers block HTTPS→HTTP calls, so a plain-IP server could never be reached
+from it.
+
+Media lives on the host at `/data` (mounted into the container as `MEDIA_DIR`),
+so generated videos survive container restarts — unlike the scale-to-zero
+platforms, where they do not.
+
+**Notes for whoever operates this next**
+- App Runner was the first choice but returns `SubscriptionRequiredException` on
+  this account. EC2 also sidesteps a build problem: App Runner is x86_64-only,
+  and building the image on an arm64 Mac would need emulation. On EC2 the build
+  runs natively on the instance.
+- The image must be **Node 22+**. `@supabase/supabase-js` builds a
+  `RealtimeClient` at import time and needs a global `WebSocket`, which Node 20
+  lacks — the server crash-loops on startup otherwise.
+- Rebuild + restart:
+  ```bash
+  ssh -i ~/.ssh/pitchbox.pem ec2-user@3.90.117.18
+  cd ~/pitchbox && git pull && sudo docker build -t pitchbox-server .
+  sudo docker rm -f pitchbox-server
+  sudo docker run -d --name pitchbox-server --network pitchbox \
+    --env-file ~/server.env -v /data:/data --restart unless-stopped pitchbox-server
+  ```
+
 ## 0. Supabase (auth + usage limits)
 
 Sign-in and the per-user run cap are backed by Supabase (see

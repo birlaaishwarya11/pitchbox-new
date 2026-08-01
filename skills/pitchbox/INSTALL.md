@@ -12,7 +12,7 @@ keys are sent per-request and never stored.
 MCP clients are launched from a static config file and cannot complete a browser
 sign-in, so they authenticate with a long-lived key instead of a session.
 
-1. Sign in to the Pitchbox web app.
+1. Sign in at <https://pitchbox-gold.vercel.app>.
 2. Go to **Settings → API keys**.
 3. **Create key**, then copy it. It starts with `pbx_live_`.
 
@@ -47,7 +47,7 @@ That produces `apps/mcp/dist/index.js`, which is what you point the client at.
 ```bash
 claude mcp add pitchbox \
   --env PITCHBOX_API_KEY=pbx_live_xxx \
-  --env PITCHBOX_SERVER_BASE=https://your-pitchbox-server \
+  --env PITCHBOX_SERVER_BASE=https://3.90.117.18.sslip.io \
   --env PITCHBOX_LLM_PROVIDER=anthropic \
   --env PITCHBOX_LLM_KEY=sk-ant-xxx \
   --env PITCHBOX_LLM_MODEL=claude-sonnet-4-6 \
@@ -68,7 +68,7 @@ Edit `claude_desktop_config.json` (macOS:
       "args": ["/absolute/path/to/pitchbox-new/apps/mcp/dist/index.js"],
       "env": {
         "PITCHBOX_API_KEY": "pbx_live_xxx",
-        "PITCHBOX_SERVER_BASE": "https://your-pitchbox-server",
+        "PITCHBOX_SERVER_BASE": "https://3.90.117.18.sslip.io",
         "PITCHBOX_LLM_PROVIDER": "anthropic",
         "PITCHBOX_LLM_KEY": "sk-ant-xxx",
         "PITCHBOX_LLM_MODEL": "claude-sonnet-4-6",
@@ -87,7 +87,7 @@ from your project directory.
 | Variable | Required | Purpose |
 |---|---|---|
 | `PITCHBOX_API_KEY` | **yes** | Your `pbx_live_…` key |
-| `PITCHBOX_SERVER_BASE` | **yes** in practice | Pitchbox server URL. Defaults to `http://localhost:3001` |
+|  `PITCHBOX_SERVER_BASE` | **yes** in practice | Pitchbox server URL. Defaults to `http://localhost:3001` |
 | `PITCHBOX_LLM_PROVIDER` | yes* | `anthropic`, `openai`, `google`, `groq`, `mistral`, `openrouter` |
 | `PITCHBOX_LLM_KEY` | yes* | Your provider key |
 | `PITCHBOX_LLM_MODEL` | yes* | Exact model id, e.g. `claude-sonnet-4-6` |
