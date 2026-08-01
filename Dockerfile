@@ -7,7 +7,10 @@
 # Includes ffmpeg (fusion + screenshot capture) and Chromium + its shared
 # libraries (Puppeteer for URL recording and slate rendering). The Daytona
 # sandbox path needs none of this on the host — it runs untrusted repos remotely.
-FROM node:20-bookworm-slim
+# Node 22, not 20: @supabase/supabase-js reaches for a global WebSocket (via
+# realtime-js) at import time, and that only exists natively from Node 22. On 20
+# the server crashes on startup as soon as the Supabase client is constructed.
+FROM node:22-bookworm-slim
 
 ENV NODE_ENV=production \
     PORT=3001 \
