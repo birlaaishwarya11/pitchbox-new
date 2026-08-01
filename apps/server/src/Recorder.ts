@@ -94,12 +94,16 @@ const DEFAULT_VIEWPORT: ViewportSize = {
   height: 720,
 };
 
+// Scroll pacing. Smaller steps taken further apart read as a deliberate
+// walkthrough rather than a page being yanked downwards — at 480px every 500ms
+// the viewer never gets to actually see a section before it leaves the frame,
+// which looks frantic under a calm voiceover.
 const DEFAULT_SCROLL: ScrollBehavior = {
-  stepPx: 480,
-  delayMs: 500,
+  stepPx: 220,
+  delayMs: 1_100,
   maxScrollMs: 60_000,
-  preScrollWaitMs: 1_500,
-  tailWaitMs: 2_000,
+  preScrollWaitMs: 2_500, // let the page settle and any hero animation play
+  tailWaitMs: 2_500,
 };
 
 const DEFAULT_FFMPEG: FfmpegOptions = {
@@ -213,7 +217,13 @@ export class Recorder {
     return 'screenshot';
   }
 
-  public async record(rawUrl: string): Promise<RecordingResult> {
+  /**
+   * @param options.targetDurationMs How long the capture should last. The
+   *   caller knows the voiceover length; without it the recording ends whenever
+   *   scrolling happens to finish, which is unrelated to the narration and left
+   *   the fused video short.
+   */
+  public async record(rawUrl: string, options: { targetDurationMs?: number } = {}): Promise<RecordingResult> {
     const url = this.normalizeUrl(rawUrl);
     const sessionId = randomUUID();
     const tmpDir = await mkdtemp(path.join(tmpdir(), 'pitchbox-rec-'));
@@ -225,7 +235,7 @@ export class Recorder {
       if (mode === 'xvfb') {
         await this.recordWithXvfb(url, tmpOutput);
       } else {
-        await this.recordWithScreenshots(url, tmpOutput);
+        await this.recordWithScreenshots(url, tmpOutput, options.targetDurationMs);
       }
 
       const endedAt = new Date();
@@ -294,7 +304,7 @@ export class Recorder {
     }
   }
 
-  private async recordWithScreenshots(url: string, tmpOutput: string): Promise<void> {
+  private async recordWithScreenshots(url: string, tmpOutput: string, targetDurationMs?: number): Promise<void> {
     let ffmpegProcess: ChildProcessWithoutNullStreams | undefined;
     let browser: Browser | undefined;
     let capturing = false;
@@ -322,7 +332,10 @@ export class Recorder {
       // page.screenshot() block with no timeout, which would stall the loop
       // forever; the watchdog stops capturing and force-closes the browser so
       // any pending screenshot rejects and the loop unwinds to finalize the mp4.
-      const hardCapMs = this.scroll.maxScrollMs + this.scroll.tailWaitMs + 10_000;
+      // The floor is the caller's target when there is one: the watchdog must
+      // never fire before the requested footage has been captured.
+      const scrollBudgetMs = this.scroll.maxScrollMs + this.scroll.tailWaitMs;
+      const hardCapMs = Math.max(scrollBudgetMs, targetDurationMs ?? 0) + 10_000;
       const capturingBrowser = browser;
       watchdog = setTimeout(() => {
         capturing = false;
@@ -333,7 +346,10 @@ export class Recorder {
       // Fire-and-forget scroll — it drives page motion while frames are captured.
       const scrollPromise = this.scrollToBottom(page).catch(() => undefined);
 
-      const tailAt = Date.now() + this.scroll.maxScrollMs + this.scroll.tailWaitMs;
+      const tailAt = Date.now() + scrollBudgetMs;
+      // Absolute end of capture. With a target we run the full length even after
+      // scrolling stops; without one we keep the old scroll-driven behaviour.
+      const endAt = targetDurationMs ? Date.now() + targetDurationMs : undefined;
       let scrollFinished = false;
       scrollPromise.finally(() => {
         scrollFinished = true;
@@ -359,7 +375,23 @@ export class Recorder {
           await new Promise<void>((resolve) => ffmpegStdin.once('drain', () => resolve()));
         }
 
-        if (scrollFinished && Date.now() >= tailAt) break;
+        if (endAt !== undefined) {
+          if (Date.now() >= endAt) break;
+          // Time left but nothing moving: restart the scroll so the footage keeps
+          // motion instead of holding one frozen frame under the narration.
+          if (scrollFinished) {
+            scrollFinished = false;
+            void page
+              .evaluate(() => window.scrollTo({ top: 0, behavior: 'auto' }))
+              .then(() => this.scrollToBottom(page))
+              .catch(() => undefined)
+              .finally(() => {
+                scrollFinished = true;
+              });
+          }
+        } else if (scrollFinished && Date.now() >= tailAt) {
+          break;
+        }
 
         const elapsed = Date.now() - frameStart;
         const wait = frameIntervalMs - elapsed;

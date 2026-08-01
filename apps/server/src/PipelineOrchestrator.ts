@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { mkdir, copyFile } from 'node:fs/promises';
 import type { SessionStore, PipelineSession, ScriptVersion } from './SessionStore';
 import { Planner } from './Planner';
@@ -18,6 +19,23 @@ import { mediaSemaphore } from './concurrency';
 
 // Recording is the flakiest stage; total attempts = 1 try + (this - 1) retries.
 const RECORD_MAX_ATTEMPTS = 2;
+
+/** Duration of a media file in ms, or 0 if it cannot be probed. */
+function probeDurationMs(filePath: string): Promise<number> {
+  return new Promise((resolve) => {
+    const proc = spawn('ffprobe', [
+      '-v', 'error', '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1', filePath,
+    ]);
+    let out = '';
+    proc.stdout.on('data', (c) => { out += c.toString(); });
+    proc.on('error', () => resolve(0));
+    proc.on('exit', () => {
+      const sec = Number(out.trim());
+      resolve(Number.isFinite(sec) ? Math.round(sec * 1000) : 0);
+    });
+  });
+}
 
 interface SessionAgents {
   planner: Planner;
@@ -334,42 +352,63 @@ export class PipelineOrchestrator {
     const store = this.deps.store;
     await mkdir(sessionDir, { recursive: true });
 
-    // 1. Audio + (optional) video in parallel.
-    store.setStage(sessionId, 'voiceover', { status: 'running' });
-    // The run's own generator, built from whichever ElevenLabs key started it.
     const audioGenerator = this.agentsBySession.get(sessionId)?.audioGenerator;
     if (!audioGenerator) {
       throw new Error('This session has expired (server restarted). Start a new one.');
     }
-    const audioPromise = audioGenerator
-      .generate(approvedScript.fullScript, { outputDir: sessionDir })
-      .then((res) => {
-        store.update(sessionId, (s) => {
-          s.audio = {
-            url: `${this.deps.publicMediaPrefix}/${sessionId}/${res.fileName}`,
-            fileName: res.fileName,
-            bytes: res.bytes,
-            durationEstimateMs: res.durationEstimateMs,
-          };
-        });
-        store.setStage(sessionId, 'voiceover', { status: 'done', message: `${Math.round(res.bytes / 1024)} KB` });
-        return res;
-      })
-      .catch((err) => {
-        store.setStage(sessionId, 'voiceover', { status: 'failed', message: String(err?.message ?? err) });
-        throw err;
-      });
 
+    // 1. Record FIRST, then voice — deliberately sequential.
+    //
+    // Recording costs only CPU; the voiceover costs the user real money. Running
+    // them in parallel meant a failed or wrong-length recording had already been
+    // paid for in ElevenLabs credit by the time anyone noticed. Doing video
+    // first also lets us check the footage actually matches the script before
+    // committing to the spend.
     const recordSelected = session.stages.find((s) => s.id === 'record')?.status !== 'skipped';
     const recordDurationMs = Math.min(approvedScript.estimatedDurationSec, 120) * 1000;
-    const videoPromise = !options.skipRecording && recordSelected
-      ? this.recordTarget(sessionId, session, recordDurationMs)
-      : Promise.resolve(null).then((v) => {
-          store.skipStage(sessionId, 'record');
-          return v;
-        });
 
-    const [audio, video] = await Promise.all([audioPromise, videoPromise]);
+    let video: { filePath: string } | null = null;
+    if (!options.skipRecording && recordSelected) {
+      video = await this.recordTarget(sessionId, session, recordDurationMs);
+      if (video) {
+        const actualMs = await probeDurationMs(video.filePath);
+        const shortfall = recordDurationMs - actualMs;
+        // Informational: the fuser loops short footage, so this is a quality
+        // signal rather than a failure. Worth logging because a large gap means
+        // the capture stopped early and the loop will be obvious to a viewer.
+        if (actualMs > 0 && shortfall > 5_000) {
+          console.warn(
+            `[pipeline ${sessionId}] recording is ${Math.round(actualMs / 1000)}s but the script needs ` +
+              `${Math.round(recordDurationMs / 1000)}s — the fuser will loop the footage to cover the gap.`,
+          );
+        }
+        store.setStage(sessionId, 'record', {
+          status: 'done',
+          message: `${Math.round(actualMs / 1000)}s captured (target ${Math.round(recordDurationMs / 1000)}s)`,
+        });
+      }
+    } else {
+      store.skipStage(sessionId, 'record');
+    }
+
+    // 2. Voiceover, now that the footage is known good.
+    store.setStage(sessionId, 'voiceover', { status: 'running' });
+    let audio;
+    try {
+      audio = await audioGenerator.generate(approvedScript.fullScript, { outputDir: sessionDir });
+      store.update(sessionId, (s) => {
+        s.audio = {
+          url: `${this.deps.publicMediaPrefix}/${sessionId}/${audio!.fileName}`,
+          fileName: audio!.fileName,
+          bytes: audio!.bytes,
+          durationEstimateMs: audio!.durationEstimateMs,
+        };
+      });
+      store.setStage(sessionId, 'voiceover', { status: 'done', message: `${Math.round(audio.bytes / 1024)} KB` });
+    } catch (err) {
+      store.setStage(sessionId, 'voiceover', { status: 'failed', message: String((err as any)?.message ?? err) });
+      throw err;
+    }
 
     // 2. Fuse
     store.setStage(sessionId, 'fuse', { status: 'running' });
@@ -480,7 +519,7 @@ export class PipelineOrchestrator {
   ): Promise<string> {
     if (session.input.recordUrl && this.deps.urlRecorder) {
       const rec = await withTimeout(
-        this.deps.urlRecorder.record(session.input.recordUrl),
+        this.deps.urlRecorder.record(session.input.recordUrl, { targetDurationMs: recordDurationMs }),
         recordCeilingMs,
         'URL recording',
       );
