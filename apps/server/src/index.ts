@@ -21,10 +21,20 @@ import { PipelineOrchestrator } from './PipelineOrchestrator';
 import { STAGE_DEFS, type StageId } from './pipelineStages';
 import { PROVIDERS } from './llm/providers';
 import { validateLlmKey, type LlmConfig } from './llm/createLlmClient';
+import helmet from 'helmet';
 import { requireUser, supabaseAdmin, isSupabaseConfigured, type AuthedRequest } from './auth/supabaseAuth';
-import { UsageLimiter, UsageLimitError } from './usage/UsageLimiter';
+import { UsageLimiter, UsageLimitError, GlobalUsageLimitError } from './usage/UsageLimiter';
+import { SessionCapacityError } from './SessionStore';
 import { TelemetryRecorder } from './usage/TelemetryRecorder';
 import { mintApiKey } from './auth/apiKeys';
+import { assertSafeUrl, BlockedUrlError } from './security/urlGuard';
+import {
+  globalLimiter,
+  startPipelineLimiter,
+  validateKeyLimiter,
+  keyMintLimiter,
+  sandboxLimiter,
+} from './security/rateLimits';
 
 const app: Express = express();
 const PORT = process.env.PORT || 3001;
@@ -121,7 +131,13 @@ function clientInfo(req: Request): { client?: string; clientVersion?: string } {
 // (sandbox recording + deploy) — the operator's remaining cost. Voiceover and
 // LLM calls are billed to the user's own keys, so they are not capped.
 const RUN_LIMIT_PER_DAY = Number.parseInt(process.env.RUN_LIMIT_PER_DAY ?? '5', 10) || 5;
-const usageLimiter = supabaseAdmin ? new UsageLimiter(supabaseAdmin, RUN_LIMIT_PER_DAY) : null;
+// Ceiling across everyone. Signup is open, so the per-user cap above bounds one
+// account, not the bill — N accounts get N times the allowance. This is the
+// number that actually limits what the operator can be charged in a day.
+const RUN_LIMIT_GLOBAL_PER_DAY = Number.parseInt(process.env.RUN_LIMIT_GLOBAL_PER_DAY ?? '50', 10) || 50;
+const usageLimiter = supabaseAdmin
+  ? new UsageLimiter(supabaseAdmin, RUN_LIMIT_PER_DAY, RUN_LIMIT_GLOBAL_PER_DAY)
+  : null;
 
 /**
  * Check + record one owner-cost run for the requesting user. Returns true if
@@ -133,6 +149,10 @@ async function enforceLimit(req: AuthedRequest, res: Response, kind: string): Pr
     await usageLimiter.consume(req.user.id, kind);
     return true;
   } catch (e) {
+    if (e instanceof GlobalUsageLimitError) {
+      res.status(429).json({ error: e.message, code: 'GLOBAL_RATE_LIMITED', limit: e.limit, used: e.used });
+      return false;
+    }
     if (e instanceof UsageLimitError) {
       res.status(429).json({ error: e.message, code: 'RATE_LIMITED', limit: e.limit, used: e.used });
       return false;
@@ -141,6 +161,23 @@ async function enforceLimit(req: AuthedRequest, res: Response, kind: string): Pr
     res.status(500).json({ error: 'Usage check failed.', code: 'USAGE_CHECK_FAILED' });
     return false;
   }
+}
+
+/**
+ * Fetch a session only if the authenticated caller started it.
+ *
+ * Responds 404 (not 403) when the session exists but belongs to someone else:
+ * a 403 would confirm the id is real, turning these routes into an existence
+ * oracle. The caller gets the same answer either way.
+ */
+function getOwnedSession(req: Request, res: Response) {
+  const authed = req as AuthedRequest;
+  const session = sessionStore.get(req.params.id);
+  if (!session || session.userId !== authed.user?.id) {
+    res.status(404).json({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
+    return null;
+  }
+  return session;
 }
 
 type DeployRequestBody = {
@@ -164,6 +201,21 @@ type RecordRequestBody = {
   appBuildCommand?: string;
 };
 
+// Behind Caddy, so the client IP arrives in X-Forwarded-For. Without this every
+// request looks like it came from the proxy and per-IP rate limits collapse into
+// one shared bucket. `1` = trust exactly one hop (our own reverse proxy) — the
+// value matters: `true` would let a client spoof its own IP via the header.
+app.set('trust proxy', 1);
+
+// Security headers. contentSecurityPolicy is off because this server only
+// returns JSON and static media — it renders no HTML of its own, so a CSP here
+// protects nothing while risking breakage of media playback.
+app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.disable('x-powered-by');
+
+// Blanket ceiling before anything else does work.
+app.use(globalLimiter);
+
 app.use(express.json({ limit: '2mb' }));
 // CORS: in production set CORS_ORIGIN to your web origin(s), comma-separated;
 // defaults to permissive for local dev.
@@ -180,7 +232,7 @@ app.get('/api/hello', (_req: Request, res: Response) => {
   res.json({ message: 'Hello from the server!' });
 });
 
-app.post('/api/record', auth, async (req: Request, res: Response) => {
+app.post('/api/record', auth, sandboxLimiter, async (req: Request, res: Response) => {
   const {
     url,
     githubUrl,
@@ -260,8 +312,20 @@ app.post('/api/record', auth, async (req: Request, res: Response) => {
     return;
   }
 
+  // Same SSRF gate as the pipeline path — this route records a URL too.
+  let safeUrl: string;
   try {
-    const recording = await recorder.record(url);
+    safeUrl = await assertSafeUrl(url);
+  } catch (e) {
+    if (e instanceof BlockedUrlError) {
+      res.status(400).json({ error: e.message, code: 'URL_NOT_ALLOWED' });
+      return;
+    }
+    throw e;
+  }
+
+  try {
+    const recording = await recorder.record(safeUrl);
     res.status(202).json({
       status: 'completed',
       recording,
@@ -277,7 +341,7 @@ app.post('/api/record', auth, async (req: Request, res: Response) => {
   }
 });
 
-app.post('/api/deploy', auth, async (req: Request, res: Response) => {
+app.post('/api/deploy', auth, sandboxLimiter, async (req: Request, res: Response) => {
   const { githubUrl, branch, commitId, workspaceDir, skipSetup } = req.body as DeployRequestBody;
 
   if (!githubUrl || typeof githubUrl !== 'string') {
@@ -404,7 +468,7 @@ app.post('/api/test/audio', auth, async (req: Request, res: Response) => {
 // All endpoints assume a single Express process and an in-memory SessionStore.
 // Sessions live ~2 hours by default and are evicted by SessionStore's sweeper.
 
-app.post('/api/pipeline/start', auth, (req: Request, res: Response) => {
+app.post('/api/pipeline/start', auth, startPipelineLimiter, async (req: Request, res: Response) => {
   const {
     githubUrl,
     branch,
@@ -447,11 +511,29 @@ app.post('/api/pipeline/start', auth, (req: Request, res: Response) => {
   const audioKey =
     typeof elevenLabsApiKey === 'string' && elevenLabsApiKey.trim() ? elevenLabsApiKey.trim() : undefined;
 
+  // SSRF gate. The recorder points a real browser at this URL and returns the
+  // frames as a video, so an internal address here is directly viewable by the
+  // requester. Checked before the session exists so nothing is spent on a
+  // request that was never going to be allowed.
+  let safeRecordUrl: string | undefined;
+  if (typeof recordUrl === 'string' && recordUrl.trim()) {
+    try {
+      safeRecordUrl = await assertSafeUrl(recordUrl.trim());
+    } catch (e) {
+      if (e instanceof BlockedUrlError) {
+        res.status(400).json({ error: e.message, code: 'URL_NOT_ALLOWED' });
+        return;
+      }
+      throw e;
+    }
+  }
+
   try {
     const session = orchestrator.start({
+      userId: (req as AuthedRequest).user!.id,
       githubUrl: typeof githubUrl === 'string' && githubUrl.trim() ? githubUrl.trim() : undefined,
       branch: typeof branch === 'string' && branch.trim() ? branch.trim() : undefined,
-      recordUrl: typeof recordUrl === 'string' && recordUrl.trim() ? recordUrl.trim() : undefined,
+      recordUrl: safeRecordUrl,
       appStartCommand: typeof appStartCommand === 'string' && appStartCommand.trim() ? appStartCommand.trim() : undefined,
       appBuildCommand: typeof appBuildCommand === 'string' && appBuildCommand.trim() ? appBuildCommand.trim() : undefined,
       sandboxPort: typeof sandboxPort === 'number' && Number.isInteger(sandboxPort) ? sandboxPort : undefined,
@@ -487,6 +569,10 @@ app.post('/api/pipeline/start', auth, (req: Request, res: Response) => {
 
     res.status(202).json({ sessionId: session.id, status: session.status });
   } catch (e) {
+    if (e instanceof SessionCapacityError) {
+      res.status(503).json({ error: e.message, code: 'AT_CAPACITY' });
+      return;
+    }
     const message = e instanceof Error ? e.message : String(e);
     const authed = req as AuthedRequest;
     telemetry?.record({
@@ -548,7 +634,7 @@ app.get('/api/keys', authJwtOnly, async (req: Request, res: Response) => {
   res.json({ keys: data ?? [] });
 });
 
-app.post('/api/keys', authJwtOnly, async (req: Request, res: Response) => {
+app.post('/api/keys', authJwtOnly, keyMintLimiter, async (req: Request, res: Response) => {
   if (!supabaseAdmin) {
     res.status(503).json({ error: 'Supabase is not configured.', code: 'AUTH_UNAVAILABLE' });
     return;
@@ -600,7 +686,7 @@ app.delete('/api/keys/:id', authJwtOnly, async (req: Request, res: Response) => 
 });
 
 // Validate a key + model with a tiny live request, mapping errors to clear text.
-app.post('/api/validate-key', async (req: Request, res: Response) => {
+app.post('/api/validate-key', validateKeyLimiter, async (req: Request, res: Response) => {
   const { provider, apiKey, model } = (req.body ?? {}) as { provider?: string; apiKey?: string; model?: string };
   if (!provider || !apiKey || !model) {
     res.status(400).json({ ok: false, message: '`provider`, `apiKey`, and `model` are all required.' });
@@ -611,15 +697,13 @@ app.post('/api/validate-key', async (req: Request, res: Response) => {
 });
 
 app.get('/api/pipeline/:id/status', auth, (req: Request, res: Response) => {
-  const session = sessionStore.get(req.params.id);
-  if (!session) {
-    res.status(404).json({ error: 'Session not found' });
-    return;
-  }
+  const session = getOwnedSession(req, res);
+  if (!session) return;
   res.json(redactSession(session));
 });
 
 app.post('/api/pipeline/:id/feedback', auth, async (req: Request, res: Response) => {
+  if (!getOwnedSession(req, res)) return;
   const { feedback } = (req.body ?? {}) as { feedback?: string };
   if (!feedback || typeof feedback !== 'string' || !feedback.trim()) {
     res.status(400).json({ error: 'A `feedback` field is required.' });
@@ -635,7 +719,8 @@ app.post('/api/pipeline/:id/feedback', auth, async (req: Request, res: Response)
 
 app.post('/api/pipeline/:id/approve', auth, async (req: Request, res: Response) => {
   const { skipRecording } = (req.body ?? {}) as { skipRecording?: boolean };
-  const existing = sessionStore.get(req.params.id);
+  const existing = getOwnedSession(req, res);
+  if (!existing) return;
 
   // Approve starts the media stage. Voiceover is billed to the caller's own
   // ElevenLabs key, so the only operator cost left is a Daytona sandbox — which
@@ -664,11 +749,8 @@ app.post('/api/pipeline/:id/approve', auth, async (req: Request, res: Response) 
 });
 
 app.get('/api/pipeline/:id/result', auth, (req: Request, res: Response) => {
-  const session = sessionStore.get(req.params.id);
-  if (!session) {
-    res.status(404).json({ error: 'Session not found' });
-    return;
-  }
+  const session = getOwnedSession(req, res);
+  if (!session) return;
   if (session.status !== 'READY') {
     res.status(409).json({ status: session.status, error: 'Result not ready yet' });
     return;
@@ -682,6 +764,7 @@ app.get('/api/pipeline/:id/result', auth, (req: Request, res: Response) => {
 });
 
 app.post('/api/pipeline/:id/reiterate', auth, (req: Request, res: Response) => {
+  if (!getOwnedSession(req, res)) return;
   try {
     const session = orchestrator.reiterate(req.params.id);
     res.json(redactSession(session));
@@ -722,7 +805,9 @@ app.listen(PORT, () => {
   if (!isSupabaseConfigured) {
     console.warn('⚠️  Supabase not configured (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY). Protected routes will return 503.');
   } else {
-    console.log(`🔐 Auth on (session or API key). Daytona-backed cap: ${RUN_LIMIT_PER_DAY} runs/day.`);
+    console.log(
+      `🔐 Auth on (session or API key). Daytona cap: ${RUN_LIMIT_PER_DAY}/user/day, ${RUN_LIMIT_GLOBAL_PER_DAY}/day across all users.`,
+    );
   }
 });
 

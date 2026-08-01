@@ -1,5 +1,6 @@
 import type { PlanArtifact, ResearchArtifact, ScriptVersion } from './SessionStore';
 import type { LlmClient } from './llm/LlmClient';
+import { wrapUntrusted } from './security/untrustedContent';
 
 export interface ScripterInput {
   userPrompt: string;
@@ -91,8 +92,7 @@ function buildUserMessage(input: ScripterInput): string {
   parts.push('');
 
   if (input.repoSummary) {
-    parts.push(`# Repository summary`);
-    parts.push(input.repoSummary.trim());
+    parts.push(wrapUntrusted('Repository summary', input.repoSummary));
     parts.push('');
   }
 

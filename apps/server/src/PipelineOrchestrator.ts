@@ -73,6 +73,8 @@ export interface StartInput {
   // generator when omitted — which a BYOK deployment does not configure, so
   // omitting both is a clear error rather than a silent charge to the operator.
   elevenLabsApiKey?: string;
+  /** Authenticated caller. Recorded on the session so routes can authorise. */
+  userId: string;
 }
 
 export class PipelineOrchestrator {
@@ -120,6 +122,7 @@ export class PipelineOrchestrator {
         userPrompt: input.userPrompt,
         targetDurationSec: input.targetDurationSec ?? 90,
       },
+      input.userId,
       selected,
     );
     this.agentsBySession.set(session.id, agents);

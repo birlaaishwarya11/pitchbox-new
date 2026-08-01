@@ -42,7 +42,15 @@ COPY tsconfig.json ./
 COPY apps/server ./apps/server
 
 # Writable output dir for generated media (ephemeral unless a blob store is set).
-RUN mkdir -p /app/recordings/sessions
+# /data is the production mount point (MEDIA_DIR); create and own it here so the
+# unprivileged user can write to it even on a fresh volume.
+RUN mkdir -p /app/recordings/sessions /data && chown -R node:node /app /data
+
+# Drop root. This process drives Chromium over pages chosen by users, so it is
+# the most likely thing in the stack to be handed hostile input — a renderer
+# escape should not land as root. `node` (uid 1000) ships with the base image
+# and matches the ownership expected on the mounted host volume.
+USER node
 
 EXPOSE 3001
 ENTRYPOINT ["dumb-init", "--"]

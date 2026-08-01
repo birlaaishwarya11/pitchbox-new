@@ -123,8 +123,15 @@ export class RepositoryCloner {
     // Handle HTTPS format: https://github.com/owner/repo or https://github.com/owner/repo.git
     try {
       const parsed = new URL(url);
-      if (!parsed.hostname.toLowerCase().includes('github.com')) {
+      // Exact host match, not `includes`: a substring test accepts
+      // `github.com.attacker.example` and `evil-github.com`, which defeats the
+      // point of having an allowlist at all.
+      const host = parsed.hostname.toLowerCase();
+      if (host !== 'github.com' && host !== 'www.github.com') {
         throw new RepositoryClonerError('Only GitHub URLs are supported');
+      }
+      if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+        throw new RepositoryClonerError('Only http(s) GitHub URLs are supported');
       }
 
       const segments = parsed.pathname.split('/').filter(Boolean);

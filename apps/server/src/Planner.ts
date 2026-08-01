@@ -1,6 +1,7 @@
 import type { PlanArtifact } from './SessionStore';
 import type { LlmClient } from './llm/LlmClient';
 import { parseJsonObject } from './llm/jsonParse';
+import { wrapUntrusted } from './security/untrustedContent';
 
 export interface PlannerInput {
   userPrompt: string;
@@ -28,7 +29,7 @@ export class Planner {
           `# User purpose / instructions`,
           input.userPrompt.trim(),
           ``,
-          input.repoSummary ? `# Repository summary\n${input.repoSummary.trim()}\n` : '',
+          input.repoSummary ? wrapUntrusted('Repository summary', input.repoSummary) : '',
           `# Default duration if user didn't specify`,
           `${defaultDuration} seconds`,
           ``,

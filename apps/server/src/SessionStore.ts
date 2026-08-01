@@ -55,6 +55,12 @@ export interface ScriptVersion {
 
 export interface PipelineSession {
   id: string;
+  /**
+   * Who started this run. Every session route compares it against the
+   * authenticated caller — without it, knowing a session id was enough to read
+   * someone's script, or approve it and spend their credits.
+   */
+  userId: string;
   createdAt: string;
   updatedAt: string;
   status: PipelineStatus;
@@ -84,6 +90,21 @@ export interface PipelineSession {
 
 const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 30 * 60 * 1000;
+/**
+ * Ceiling on live sessions. Each retains a plan, research and every script
+ * version in memory, and the host is a 2GB box — without a cap, a script
+ * looping on /api/pipeline/start exhausts memory long before the 2h sweeper
+ * runs. Tunable, but the default should stay well under what the box can hold.
+ */
+const MAX_LIVE_SESSIONS = Number.parseInt(process.env.MAX_LIVE_SESSIONS ?? '200', 10) || 200;
+
+/** Raised when the instance is already holding as many sessions as it can. */
+export class SessionCapacityError extends Error {
+  constructor() {
+    super('This instance is at capacity right now. Try again in a few minutes.');
+    this.name = 'SessionCapacityError';
+  }
+}
 
 export class SessionStore {
   private readonly sessions = new Map<string, PipelineSession>();
@@ -109,7 +130,8 @@ export class SessionStore {
     }
   }
 
-  create(input: PipelineSession['input'], selectedStages?: Set<StageId>): PipelineSession {
+  create(input: PipelineSession['input'], userId: string, selectedStages?: Set<StageId>): PipelineSession {
+    if (this.sessions.size >= MAX_LIVE_SESSIONS) throw new SessionCapacityError();
     const id = randomUUID();
     const workDir = path.join(this.rootDir, id);
     const now = new Date().toISOString();
@@ -120,6 +142,7 @@ export class SessionStore {
     }));
     const session: PipelineSession = {
       id,
+      userId,
       createdAt: now,
       updatedAt: now,
       status: 'CREATED',
