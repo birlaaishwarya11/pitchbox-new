@@ -87,7 +87,7 @@ from your project directory.
 | Variable | Required | Purpose |
 |---|---|---|
 | `PITCHBOX_API_KEY` | **yes** | Your `pbx_live_…` key |
-|  `PITCHBOX_SERVER_BASE` | **yes** in practice | Pitchbox server URL. Defaults to `http://localhost:3001` |
+| `PITCHBOX_SERVER_BASE` | **yes** in practice | Pitchbox server URL. Defaults to `http://localhost:3001` |
 | `PITCHBOX_LLM_PROVIDER` | yes* | `anthropic`, `openai`, `google`, `groq`, `mistral`, `openrouter` |
 | `PITCHBOX_LLM_KEY` | yes* | Your provider key |
 | `PITCHBOX_LLM_MODEL` | yes* | Exact model id, e.g. `claude-sonnet-4-6` |
@@ -129,8 +129,10 @@ new one in the web app.
 a sandbox on the operator's account. Recording a deployed URL and
 `skipRecording: true` are uncapped.
 
-**Video URL 404s.** Media is ephemeral on the hosted server and is cleared when
-it restarts. Download the MP4 promptly, or self-host with a persistent volume.
+**Video URL 404s.** Sessions expire about **two hours** after their last update,
+and expiry deletes the generated media with them. The files survive server
+restarts (they live on a persistent volume), but not that two-hour window — so
+download the MP4 reasonably promptly.
 
 ## What is recorded about your usage
 
