@@ -47,7 +47,7 @@ That produces `apps/mcp/dist/index.js`, which is what you point the client at.
 ```bash
 claude mcp add pitchbox \
   --env PITCHBOX_API_KEY=pbx_live_xxx \
-  --env PITCHBOX_SERVER_BASE=https://3.90.117.18.sslip.io \
+  --env PITCHBOX_SERVER_BASE=https://pitchbox-gold.vercel.app \
   --env PITCHBOX_LLM_PROVIDER=anthropic \
   --env PITCHBOX_LLM_KEY=sk-ant-xxx \
   --env PITCHBOX_LLM_MODEL=claude-sonnet-5 \
@@ -68,7 +68,7 @@ Edit `claude_desktop_config.json` (macOS:
       "args": ["/absolute/path/to/pitchbox-new/apps/mcp/dist/index.js"],
       "env": {
         "PITCHBOX_API_KEY": "pbx_live_xxx",
-        "PITCHBOX_SERVER_BASE": "https://3.90.117.18.sslip.io",
+        "PITCHBOX_SERVER_BASE": "https://pitchbox-gold.vercel.app",
         "PITCHBOX_LLM_PROVIDER": "anthropic",
         "PITCHBOX_LLM_KEY": "sk-ant-xxx",
         "PITCHBOX_LLM_MODEL": "claude-sonnet-5",

@@ -10,7 +10,8 @@ ffmpeg + Puppeteer + Daytona → a container host). See
 |---|---|
 | Web | Vercel — <https://pitchbox-gold.vercel.app> |
 | Server | AWS EC2 `t3.small` (us-east-1), Elastic IP `3.90.117.18` |
-| Server URL | <https://3.90.117.18.sslip.io> |
+| Public API URL | <https://pitchbox-gold.vercel.app> — Vercel proxies `/api`, `/sessions`, `/test-audio` to the server |
+| Direct server URL | <https://3.90.117.18.sslip.io> — origin only; not the address users are given |
 | Auth + usage | Supabase project `ebztagjgciwxwqavafte` |
 
 The server runs two containers on a user-defined Docker network: the app itself,
@@ -19,6 +20,13 @@ and Caddy terminating TLS. There is no domain — `sslip.io` resolves
 certificate. HTTPS is not optional here: the Vercel front end is HTTPS and
 browsers block HTTPS→HTTP calls, so a plain-IP server could never be reached
 from it.
+
+Users are never given that address. Vercel rewrites `/api`, `/sessions` and
+`/test-audio` to the origin, so the whole product lives on one hostname — which
+also makes browser requests same-origin (no CORS) and lets the backend move
+without invalidating published MCP configs. The trade is Vercel's **120s cap on
+proxied requests**: fine for the asynchronous pipeline, but `/api/record` and
+`/api/deploy` are synchronous and can exceed it on a slow sandbox.
 
 Media lives on the host at `/data` (mounted into the container as `MEDIA_DIR`),
 so generated videos survive container restarts — unlike the scale-to-zero
