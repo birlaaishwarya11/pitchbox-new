@@ -1,6 +1,8 @@
 /// <reference lib="dom" />
 import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { harvestTargets, installCinematics, applyShot, resetCamera } from './cinematics/pageScript';
+import type { PageTarget, Shot } from './cinematics/types';
 import { mkdtemp, mkdir, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -223,7 +225,18 @@ export class Recorder {
    *   scrolling happens to finish, which is unrelated to the narration and left
    *   the fused video short.
    */
-  public async record(rawUrl: string, options: { targetDurationMs?: number } = {}): Promise<RecordingResult> {
+  public async record(
+    rawUrl: string,
+    options: {
+      targetDurationMs?: number;
+      /**
+       * Given the elements found on the page, return the camera moves to make.
+       * Optional: without it the recorder falls back to a plain scroll, which is
+       * what happens when no LLM is available or shot planning fails.
+       */
+      planShots?: (targets: PageTarget[]) => Promise<Shot[]>;
+    } = {},
+  ): Promise<RecordingResult> {
     const url = this.normalizeUrl(rawUrl);
     const sessionId = randomUUID();
     const tmpDir = await mkdtemp(path.join(tmpdir(), 'pitchbox-rec-'));
@@ -235,7 +248,7 @@ export class Recorder {
       if (mode === 'xvfb') {
         await this.recordWithXvfb(url, tmpOutput);
       } else {
-        await this.recordWithScreenshots(url, tmpOutput, options.targetDurationMs);
+        await this.recordWithScreenshots(url, tmpOutput, options.targetDurationMs, options.planShots);
       }
 
       const endedAt = new Date();
@@ -304,7 +317,12 @@ export class Recorder {
     }
   }
 
-  private async recordWithScreenshots(url: string, tmpOutput: string, targetDurationMs?: number): Promise<void> {
+  private async recordWithScreenshots(
+    url: string,
+    tmpOutput: string,
+    targetDurationMs?: number,
+    planShots?: (targets: PageTarget[]) => Promise<Shot[]>,
+  ): Promise<void> {
     let ffmpegProcess: ChildProcessWithoutNullStreams | undefined;
     let browser: Browser | undefined;
     let capturing = false;
@@ -325,6 +343,23 @@ export class Recorder {
       await page.setViewport({ width: this.viewport.width, height: this.viewport.height });
       await this.preparePage(page, url);
 
+      // Plan the camera before any frame is captured, so shot 0 is already in
+      // place when recording starts. Failure here is not fatal: a plain scroll
+      // is a worse video, not a broken one.
+      let shots: Shot[] = [];
+      if (planShots) {
+        try {
+          const targets = await page.evaluate(harvestTargets);
+          if (targets.length) {
+            shots = await planShots(targets);
+            await page.evaluate(installCinematics);
+          }
+        } catch (err) {
+          console.warn('[recorder] shot planning failed, falling back to scroll:', err);
+          shots = [];
+        }
+      }
+
       capturing = true;
       const frameIntervalMs = Math.max(1, Math.floor(1000 / this.ffmpeg.frameRate));
 
@@ -343,8 +378,13 @@ export class Recorder {
       }, hardCapMs);
       watchdog.unref?.();
 
-      // Fire-and-forget scroll — it drives page motion while frames are captured.
-      const scrollPromise = this.scrollToBottom(page).catch(() => undefined);
+      // Either the camera runs the shot list, or we fall back to scrolling.
+      // Both are fire-and-forget: they drive motion while frames are captured.
+      const scrollPromise = shots.length
+        ? this.runShotList(page, shots, targetDurationMs ?? 0).catch((err) => {
+            console.warn('[recorder] shot list aborted:', err);
+          })
+        : this.scrollToBottom(page).catch(() => undefined);
 
       const tailAt = Date.now() + scrollBudgetMs;
       // Absolute end of capture. With a target we run the full length even after
@@ -716,6 +756,31 @@ export class Recorder {
     }
     await page.waitForNetworkIdle({ idleTime: 500, timeout: 8_000 }).catch(() => undefined);
     await this.delay(this.scroll.preScrollWaitMs);
+  }
+
+  /**
+   * Execute planned shots against the wall clock.
+   *
+   * Timing is absolute rather than cumulative: a slow `applyShot` would
+   * otherwise push every later shot out of sync with the narration, and the
+   * whole point is that the picture lands on the sentence.
+   */
+  private async runShotList(page: Page, shots: Shot[], totalMs: number): Promise<void> {
+    const startedAt = Date.now();
+    for (const shot of shots) {
+      const dueAt = startedAt + shot.atSec * 1000;
+      const wait = dueAt - Date.now();
+      if (wait > 0) await this.delay(wait);
+      if (totalMs && Date.now() - startedAt >= totalMs) break;
+      try {
+        await page.evaluate(applyShot, shot.selector, shot.zoom, shot.highlight);
+      } catch {
+        // A selector can stop resolving if the page re-rendered. Skip the shot
+        // rather than abandoning the rest of the sequence.
+      }
+    }
+    // Ease out so the video does not end mid-push.
+    await page.evaluate(resetCamera).catch(() => undefined);
   }
 
   private async scrollToBottom(page: Page): Promise<void> {

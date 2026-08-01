@@ -5,6 +5,7 @@ import type { SessionStore, PipelineSession, ScriptVersion } from './SessionStor
 import { Planner } from './Planner';
 import { Researcher } from './Researcher';
 import { Scripter } from './Scripter';
+import { Cinematographer } from './Cinematographer';
 import { createLlmClient, type LlmConfig } from './llm/createLlmClient';
 import { AudioGenerator } from './AudioGenerator';
 import type { Fuser } from './Fuser';
@@ -41,6 +42,8 @@ interface SessionAgents {
   planner: Planner;
   researcher: Researcher;
   scripter: Scripter;
+  // Plans the camera moves over the recording, on the run's own LLM key.
+  cinematographer: Cinematographer;
   // Bound per session: voiceover is billed to whoever's ElevenLabs key ran it,
   // so the generator cannot be shared across users the way a stateless helper
   // like Fuser can.
@@ -108,6 +111,7 @@ export class PipelineOrchestrator {
       planner: new Planner(client),
       researcher: new Researcher(client),
       scripter: new Scripter(client),
+      cinematographer: new Cinematographer(client),
       audioGenerator,
     };
   }
@@ -518,8 +522,29 @@ export class PipelineOrchestrator {
     recordCeilingMs: number,
   ): Promise<string> {
     if (session.input.recordUrl && this.deps.urlRecorder) {
+      const cinematographer = this.agentsBySession.get(session.id)?.cinematographer;
+      const approved =
+        session.scriptVersions.find((v) => v.id === session.approvedVersionId) ??
+        session.scriptVersions[session.scriptVersions.length - 1];
+
       const rec = await withTimeout(
-        this.deps.urlRecorder.record(session.input.recordUrl, { targetDurationMs: recordDurationMs }),
+        this.deps.urlRecorder.record(session.input.recordUrl, {
+          targetDurationMs: recordDurationMs,
+          // Only plan shots when we have both an agent and a script to time
+          // against. A failed plan falls back to scrolling inside the recorder.
+          planShots:
+            cinematographer && approved
+              ? async (targets) => {
+                  const plan = await cinematographer.plan({
+                    script: approved.fullScript,
+                    durationSec: recordDurationMs / 1000,
+                    targets,
+                  });
+                  console.log(`[pipeline ${session.id}] planned ${plan.shots.length} camera shots`);
+                  return plan.shots;
+                }
+              : undefined,
+        }),
         recordCeilingMs,
         'URL recording',
       );
