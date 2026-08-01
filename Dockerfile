@@ -25,11 +25,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install workspace deps. Copy manifests first for layer caching; both app
-# package.json files are required for `npm ci` against the shared lockfile.
+# Install workspace deps. Copy manifests first for layer caching. EVERY
+# workspace manifest is required: `npm ci` validates the tree against the shared
+# lockfile and fails outright if one referenced there is missing from disk.
 COPY package.json package-lock.json ./
 COPY apps/server/package.json apps/server/package.json
 COPY apps/web/package.json apps/web/package.json
+COPY apps/mcp/package.json apps/mcp/package.json
 RUN npm ci
 
 # Server source + base tsconfig (tsx reads TS directly).
