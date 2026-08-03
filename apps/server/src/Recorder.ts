@@ -254,8 +254,16 @@ class CaptureGate {
     return this.pendingInput > 0;
   }
 
-  /** Capture side. Records the in-flight frame so input can wait on it. */
+  /**
+   * Capture side.
+   *
+   * The pending-input check is repeated here rather than trusted from the
+   * caller: the loop checks, then calls this, and in that gap an input can
+   * arrive. Reading the flag at the moment the frame is actually started is what
+   * closes the window.
+   */
   async capture<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.pendingInput > 0) throw new Error('input in progress');
     const task = fn();
     this.inFlight = task;
     try {
@@ -265,22 +273,25 @@ class CaptureGate {
     }
   }
 
-  /** Input side. Yields to a running frame, but never waits on a stuck one. */
+  /**
+   * Input side. Waits for the channel to be clear, but never on a stuck frame.
+   *
+   * The wait is a loop, not a single observation. Reading `inFlight` once raced
+   * the capture loop: the loop saw no pending input, input saw no frame in
+   * flight because the write had not landed yet, and both went — so the click
+   * was eaten exactly as before the gate existed. Incrementing the counter
+   * *before* waiting is what makes the pairing safe: from here on, `capture`
+   * refuses to start, so the loop drains and stays drained.
+   */
   async input<T>(fn: () => Promise<T>): Promise<T> {
     this.pendingInput += 1;
     try {
-      const running = this.inFlight;
-      if (running) {
-        await Promise.race([
-          running.then(
-            () => undefined,
-            () => undefined,
-          ),
-          new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, INPUT_SETTLE_MS);
-            timer.unref?.();
-          }),
-        ]);
+      const deadline = Date.now() + INPUT_SETTLE_MS;
+      while (this.inFlight && Date.now() < deadline) {
+        await this.inFlight.then(
+          () => undefined,
+          () => undefined,
+        );
       }
       return await fn();
     } finally {
@@ -674,6 +685,12 @@ export class Recorder {
           )) as Buffer;
           healthyAt = Date.now();
         } catch (err) {
+          // A frame refused because input is being dispatched is not a failure:
+          // it is the gate working. Retry immediately without counting it.
+          if (err instanceof Error && err.message === 'input in progress') {
+            await this.delay(15);
+            continue;
+          }
           // The walkthrough navigates mid-capture, and a screenshot straddling
           // a document swap fails or stalls. Dropping the recording there would
           // truncate it at the first page change, so ride the failures out and
