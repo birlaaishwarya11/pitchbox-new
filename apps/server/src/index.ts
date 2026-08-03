@@ -821,6 +821,69 @@ app.get('/api/pipeline/:id/result', auth, (req: Request, res: Response) => {
   });
 });
 
+/**
+ * The walkthrough review gate.
+ *
+ * `PATCH`-like semantics on one route: a body with `feedback` asks the planner to
+ * revise, a body with `text` records the caller's own wording verbatim. Both
+ * append a version rather than overwriting, so approving is always approving
+ * something specific.
+ */
+app.post('/api/pipeline/:id/flow', auth, async (req: Request, res: Response) => {
+  const session = sessionStore.get(req.params.id);
+  if (!session) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+  if (session.userId !== (req as AuthedRequest).user!.id) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+
+  const { feedback, text } = (req.body ?? {}) as { feedback?: string; text?: string };
+  try {
+    if (typeof text === 'string' && text.trim()) {
+      const version = orchestrator.editFlowPlan(req.params.id, text.trim());
+      res.json({ version, session: sessionStore.get(req.params.id) });
+      return;
+    }
+    if (typeof feedback === 'string' && feedback.trim()) {
+      const version = await orchestrator.iterateFlowPlan(req.params.id, feedback.trim());
+      res.json({ version, session: sessionStore.get(req.params.id) });
+      return;
+    }
+    res.status(400).json({ error: 'Provide `text` to save your own wording, or `feedback` to ask for changes.' });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Approve the walkthrough and start recording, voiceover and fusion. */
+app.post('/api/pipeline/:id/flow/approve', auth, async (req: Request, res: Response) => {
+  const session = sessionStore.get(req.params.id);
+  if (!session) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+  if (session.userId !== (req as AuthedRequest).user!.id) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+
+  const { skipRecording } = (req.body ?? {}) as { skipRecording?: boolean };
+  // Same cost gate as approving a script: this is the point where a sandbox and
+  // a voiceover actually get spent.
+  const willUseSandbox = !!session.input.githubUrl && !session.input.recordUrl && skipRecording !== true;
+  if (willUseSandbox && !(await enforceLimit(req as AuthedRequest, res, 'approve'))) return;
+
+  try {
+    const updated = orchestrator.approveFlowPlan(req.params.id, { skipRecording: skipRecording === true });
+    res.status(202).json({ session: updated });
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 app.post('/api/pipeline/:id/reiterate', auth, (req: Request, res: Response) => {
   if (!getOwnedSession(req, res)) return;
   try {

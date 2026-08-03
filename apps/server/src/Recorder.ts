@@ -152,8 +152,21 @@ const FRAME_FAILURE_WINDOW_MS = 25_000;
  * swaps documents — which is precisely when the walkthrough is navigating.
  */
 const SCREENSHOT_TIMEOUT_MS = 15_000;
-/** How long an input event will wait for an in-flight screenshot to finish. */
-const INPUT_SETTLE_MS = 400;
+/**
+ * How long an input event will wait for an in-flight screenshot to finish.
+ *
+ * Generous on purpose. A screenshot in flight eats a mouse click, and 400ms was
+ * only ever enough for a local page: against a remote site frames take longer
+ * than that, the input went anyway, and the click vanished — the button visibly
+ * ringed, the cursor on it, no error, nothing happening. That is what stalled a
+ * recording on a sign-in screen for forty seconds.
+ *
+ * Waiting this long is safe because frames now carry their own deadline, so the
+ * thing being waited on always settles. It is still bounded rather than
+ * unbounded, because a shared queue between input and capture is what deadlocked
+ * an earlier attempt at this.
+ */
+const INPUT_SETTLE_MS = 5_000;
 /**
  * Deadline for the very first frame, which doubles as a probe.
  *

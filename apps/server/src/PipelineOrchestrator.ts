@@ -2,11 +2,12 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, copyFile, access } from 'node:fs/promises';
-import type { SessionStore, PipelineSession, ScriptVersion } from './SessionStore';
+import type { SessionStore, PipelineSession, ScriptVersion, FlowPlanVersion } from './SessionStore';
 import { Planner } from './Planner';
 import { Researcher } from './Researcher';
 import { Scripter } from './Scripter';
 import { Director } from './Director';
+import { FlowPlanner } from './FlowPlanner';
 import type { SiteScout } from './SiteScout';
 import { makeDummyIdentity, type DummyIdentity } from './cinematics/dummyIdentity';
 import type { Beat, SiteMap } from './cinematics/types';
@@ -60,6 +61,8 @@ interface SessionAgents {
   scripter: Scripter;
   // Plans what the app does on camera and how it is framed, on the run's own key.
   director: Director;
+  // Proposes the walkthrough in prose for the caller to edit and approve.
+  flowPlanner: FlowPlanner;
   // The shared client behind all four agents — carries this run's token totals.
   llmClient: LlmClient;
   // Bound per session: voiceover is billed to whoever's ElevenLabs key ran it,
@@ -167,6 +170,7 @@ export class PipelineOrchestrator {
       researcher: new Researcher(client),
       scripter: new Scripter(client),
       director: new Director(client),
+      flowPlanner: new FlowPlanner(client),
       llmClient: client,
       audioGenerator,
     };
@@ -247,7 +251,17 @@ export class PipelineOrchestrator {
     });
   }
 
-  /** Approve the latest script and start audio + video + fusion (background). */
+  /**
+   * Approve the latest script.
+   *
+   * When there is something to record, this no longer starts recording. It
+   * explores the target and proposes a walkthrough for the caller to read, edit
+   * and approve — because the alternative, which is what this used to do, is that
+   * nobody finds out what the demo actually did until the video exists and the
+   * money is spent. `approveFlowPlan` is what starts the media stages.
+   *
+   * With nothing to record, there is no flow to review, so it proceeds directly.
+   */
   approve(sessionId: string, options: { skipRecording?: boolean } = {}): PipelineSession {
     const session = this.requireSession(sessionId);
     const latest = session.scriptVersions[session.scriptVersions.length - 1];
@@ -255,11 +269,141 @@ export class PipelineOrchestrator {
 
     this.deps.store.update(sessionId, (s) => {
       s.approvedVersionId = latest.id;
+      s.error = undefined;
+    });
+
+    const flowSelected = session.stages.find((s) => s.id === 'flow')?.status !== 'skipped';
+    if (this.willRecord(session, options) && flowSelected) {
+      this.deps.store.setStatus(sessionId, 'FLOW_REVIEW');
+      void this.proposeFlowPlan(sessionId, latest).catch((err) => {
+        console.error(`[pipeline ${sessionId}] flow-plan failure:`, err);
+        this.deps.store.setStage(sessionId, 'flow', { status: 'failed', message: String(err?.message ?? err) });
+        // Not fatal: without a plan the director falls back to deciding for
+        // itself, which is the old behaviour rather than a broken run.
+        this.deps.store.setStatus(sessionId, 'FLOW_REVIEW');
+      });
+      return this.requireSession(sessionId);
+    }
+
+    this.deps.store.skipStage(sessionId, 'flow');
+    return this.startMediaStages(sessionId, options);
+  }
+
+  /** True when this run has somewhere to point a camera. */
+  private willRecord(session: PipelineSession, options: { skipRecording?: boolean }): boolean {
+    if (options.skipRecording) return false;
+    if (session.stages.find((s) => s.id === 'record')?.status === 'skipped') return false;
+    return Boolean(
+      (session.input.recordUrl && this.deps.urlRecorder) ||
+        (session.input.githubUrl && this.deps.sandboxRecorder),
+    );
+  }
+
+  /** Explore the target and propose a walkthrough, then wait for the caller. */
+  private async proposeFlowPlan(sessionId: string, approvedScript: ScriptVersion): Promise<void> {
+    const session = this.requireSession(sessionId);
+    const agents = this.agentsBySession.get(sessionId);
+    const scout = this.deps.siteScout;
+    const target = session.input.recordUrl;
+    if (!agents) throw new Error('This session has expired (server restarted). Start a new one.');
+
+    const store = this.deps.store;
+    store.setStage(sessionId, 'flow', { status: 'running', message: 'exploring the target…' });
+
+    // Only the URL path can be explored from here. A repo lives inside a sandbox
+    // that does not exist until recording starts, so its flow is proposed from
+    // the prompt and script alone and refined by the director in there.
+    let siteMap = this.siteMapBySession.get(sessionId);
+    if (!siteMap && scout && target) {
+      siteMap = await scout.explore(target, makeDummyIdentity(`${sessionId}:scout`));
+      this.siteMapBySession.set(sessionId, siteMap);
+      console.log(
+        `[pipeline ${sessionId}] scouted ${siteMap.screens.length} screen(s) for the flow plan: ` +
+          siteMap.screens.map((s) => s.path).join(', '),
+      );
+    }
+    if (!siteMap) {
+      store.setStage(sessionId, 'flow', {
+        status: 'skipped',
+        message: 'nothing to explore yet — the flow is planned inside the sandbox',
+      });
+      return;
+    }
+
+    store.setStage(sessionId, 'flow', { status: 'running', message: 'proposing the walkthrough…' });
+    const text = await agents.flowPlanner.propose({
+      userPrompt: session.input.userPrompt,
+      script: approvedScript.fullScript,
+      durationSec: Math.min(approvedScript.estimatedDurationSec, 120),
+      siteMap,
+      identity: makeDummyIdentity(`${sessionId}:take`),
+    });
+    store.appendFlowPlanVersion(sessionId, { text });
+    store.setStage(sessionId, 'flow', { status: 'done', message: 'waiting for your approval' });
+  }
+
+  /** Revise the walkthrough from the caller's feedback, producing a new version. */
+  async iterateFlowPlan(sessionId: string, feedback: string): Promise<FlowPlanVersion> {
+    const session = this.requireSession(sessionId);
+    const agents = this.agentsBySession.get(sessionId);
+    const siteMap = this.siteMapBySession.get(sessionId);
+    const approved =
+      session.scriptVersions.find((v) => v.id === session.approvedVersionId) ??
+      session.scriptVersions[session.scriptVersions.length - 1];
+    if (!agents) throw new Error('This session has expired (server restarted). Start a new one.');
+    if (!siteMap) throw new Error('The target has not been explored yet.');
+    if (!approved) throw new Error('Approve a script first.');
+
+    const previous = session.flowPlanVersions[session.flowPlanVersions.length - 1];
+    const text = await agents.flowPlanner.propose({
+      userPrompt: session.input.userPrompt,
+      script: approved.fullScript,
+      durationSec: Math.min(approved.estimatedDurationSec, 120),
+      siteMap,
+      identity: makeDummyIdentity(`${sessionId}:take`),
+      previous: previous?.text,
+      feedback,
+    });
+    return this.deps.store.appendFlowPlanVersion(sessionId, { text, feedbackUsed: feedback });
+  }
+
+  /**
+   * Record the caller's own text as the latest version.
+   *
+   * Taken verbatim. They were shown a box and told they could edit it, so what
+   * is in the box is what gets built — the director is told to treat it as
+   * authoritative rather than as a suggestion to reinterpret.
+   */
+  editFlowPlan(sessionId: string, text: string): FlowPlanVersion {
+    this.requireSession(sessionId);
+    return this.deps.store.appendFlowPlanVersion(sessionId, { text, editedByUser: true });
+  }
+
+  /** Approve the latest walkthrough and start audio + video + fusion. */
+  approveFlowPlan(sessionId: string, options: { skipRecording?: boolean } = {}): PipelineSession {
+    const session = this.requireSession(sessionId);
+    const latest = session.flowPlanVersions[session.flowPlanVersions.length - 1];
+    if (latest) {
+      this.deps.store.update(sessionId, (s) => {
+        s.approvedFlowPlanId = latest.id;
+      });
+    }
+    return this.startMediaStages(sessionId, options);
+  }
+
+  private startMediaStages(sessionId: string, options: { skipRecording?: boolean }): PipelineSession {
+    const session = this.requireSession(sessionId);
+    const approvedScript =
+      session.scriptVersions.find((v) => v.id === session.approvedVersionId) ??
+      session.scriptVersions[session.scriptVersions.length - 1];
+    if (!approvedScript) throw new Error('No script to approve');
+
+    this.deps.store.update(sessionId, (s) => {
       s.status = 'GENERATING';
       s.error = undefined;
     });
 
-    void this.runMediaStages(sessionId, latest, options).catch((err) => {
+    void this.runMediaStages(sessionId, approvedScript, options).catch((err) => {
       console.error(`[pipeline ${sessionId}] media-stage failure:`, err);
       this.deps.store.setError(sessionId, this.deps.store.get(sessionId)?.status ?? 'GENERATING', String(err?.message ?? err));
     });
@@ -686,11 +830,21 @@ export class PipelineOrchestrator {
       }
 
       store.setStage(session.id, 'record', { status: 'running', message: 'planning the walkthrough…' });
+      const approvedFlow = session.flowPlanVersions.find((v) => v.id === session.approvedFlowPlanId)
+        ?? session.flowPlanVersions[session.flowPlanVersions.length - 1];
+      if (approvedFlow) {
+        console.log(
+          `[pipeline ${session.id}] directing from the approved walkthrough (v${approvedFlow.versionNumber}` +
+            `${approvedFlow.editedByUser ? ', edited by hand' : ''})`,
+        );
+      }
+
       const walkthrough = await director.plan({
         script,
         durationSec: recordDurationMs / 1000,
         siteMap,
         identity: takeIdentity,
+        flowPlan: approvedFlow?.text,
       });
       const actions = walkthrough.beats.filter((b) => b.action !== 'hold' && b.action !== 'scrollTo').length;
       console.log(
@@ -766,11 +920,18 @@ export class PipelineOrchestrator {
           planWalkthrough:
             director && approved
               ? async (siteMap) => {
+                  // The repo's flow is planned in here rather than reviewed up
+                  // front — the sandbox it lives in does not exist until now —
+                  // but an approved plan from the caller still outranks it.
+                  const approvedFlow =
+                    session.flowPlanVersions.find((v) => v.id === session.approvedFlowPlanId) ??
+                    session.flowPlanVersions[session.flowPlanVersions.length - 1];
                   const { beats } = await director.plan({
                     script: approved.fullScript,
                     durationSec: recordDurationMs / 1000,
                     siteMap,
                     identity,
+                    flowPlan: approvedFlow?.text,
                   });
                   console.log(`[pipeline ${session.id}] directed ${beats.length} beats for the sandbox`);
                   return { beats, identity };

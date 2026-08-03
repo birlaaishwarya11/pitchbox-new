@@ -110,6 +110,13 @@ export interface DirectorInput {
   siteMap: SiteMap;
   /** The persona whose values will be typed, for narration alignment. */
   identity: DummyIdentity;
+  /**
+   * The walkthrough the caller approved, in prose.
+   *
+   * Authoritative when present: it has been read and possibly rewritten by a
+   * human, so it outranks anything this agent would have chosen for itself.
+   */
+  flowPlan?: string;
 }
 
 export class Director {
@@ -131,6 +138,19 @@ export class Director {
         `# Voiceover script (timing reference)`,
         input.script.trim(),
         ``,
+        ...(input.flowPlan
+          ? [
+              `# THE APPROVED WALKTHROUGH — follow this`,
+              `A human read this and signed it off. Perform these steps, in this order, with these`,
+              `values. Do not substitute a flow you would have preferred. Your job is the timing and`,
+              `the framing: map each step onto the selectors below and place it against the narration.`,
+              `If a step cannot be mapped to anything available, skip that step rather than inventing`,
+              `a different one.`,
+              ``,
+              input.flowPlan.trim(),
+              ``,
+            ]
+          : []),
         `# Persona that will be typed in`,
         `Name ${input.identity.fullName} · ${input.identity.email} · ${input.identity.company}.`,
         `Refer to tokens, not these literals.`,

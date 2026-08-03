@@ -2,7 +2,7 @@
 // orchestrator (to drive execution + status) and surfaced to the client so the
 // progress board and stage-selection panel stay in sync with the backend.
 
-export type StageId = 'analyze' | 'plan' | 'research' | 'script' | 'record' | 'voiceover' | 'fuse';
+export type StageId = 'analyze' | 'plan' | 'research' | 'script' | 'flow' | 'record' | 'voiceover' | 'fuse';
 
 export type StageStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 
@@ -23,6 +23,10 @@ export const STAGE_DEFS: StageDef[] = [
   { id: 'plan', label: 'Plan', group: 'script', dependsOn: [], optional: false },
   { id: 'research', label: 'Research', group: 'script', dependsOn: ['plan'], optional: true },
   { id: 'script', label: 'Write script', group: 'script', dependsOn: ['plan'], optional: false },
+  // Explores the target and proposes the flow to demonstrate, for the caller to
+  // edit and approve before anything is recorded. Not optional when recording:
+  // the whole point is that nobody finds out what the demo did afterwards.
+  { id: 'flow', label: 'Plan the walkthrough', group: 'generate', dependsOn: ['script'], optional: true },
   { id: 'record', label: 'Screen recording', group: 'generate', dependsOn: [], optional: true },
   { id: 'voiceover', label: 'Voiceover', group: 'generate', dependsOn: ['script'], optional: false },
   { id: 'fuse', label: 'Assemble video', group: 'generate', dependsOn: ['voiceover'], optional: false },

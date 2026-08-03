@@ -21,7 +21,7 @@ async function authFetch(input: string, init: RequestInit = {}): Promise<Respons
   return fetch(input, { ...init, headers });
 }
 
-type Status = 'CREATED' | 'PLANNING' | 'RESEARCHING' | 'SCRIPT_DRAFT' | 'GENERATING' | 'FUSING' | 'READY' | 'ERROR';
+type Status = 'CREATED' | 'PLANNING' | 'RESEARCHING' | 'SCRIPT_DRAFT' | 'FLOW_REVIEW' | 'GENERATING' | 'FUSING' | 'READY' | 'ERROR';
 
 type LlmCfg = { provider: string; apiKey: string; model: string };
 type ProviderInfo = {
@@ -32,7 +32,7 @@ type ProviderInfo = {
   models: { id: string; label: string; free?: boolean }[];
 };
 
-type StageId = 'analyze' | 'plan' | 'research' | 'script' | 'record' | 'voiceover' | 'fuse';
+type StageId = 'analyze' | 'plan' | 'research' | 'script' | 'flow' | 'record' | 'voiceover' | 'fuse';
 type StageStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 type StageState = {
   id: StageId;
@@ -60,6 +60,16 @@ const STAGE_META: {
   { id: 'voiceover', label: 'Voiceover', group: 'Generate', optional: false, hint: 'ElevenLabs narration' },
   { id: 'fuse', label: 'Assemble video', group: 'Generate', optional: false, hint: 'Mux audio onto the capture/slate' },
 ];
+
+type FlowPlanVersion = {
+  id: string;
+  versionNumber: number;
+  createdAt: string;
+  text: string;
+  feedbackUsed?: string;
+  editedByUser?: boolean;
+  parentVersionId?: string;
+};
 
 type ScriptVersion = {
   id: string;
@@ -98,6 +108,8 @@ type Session = {
     citations: { title: string; url: string }[];
   };
   scriptVersions: ScriptVersion[];
+  flowPlanVersions: FlowPlanVersion[];
+  approvedFlowPlanId?: string;
   approvedVersionId?: string;
   audio?: { url: string };
   video?: { url: string };
@@ -155,6 +167,12 @@ export default function PipelinePage() {
   // Feedback box
   const [feedback, setFeedback] = useState('');
   const [iterating, setIterating] = useState(false);
+  // The flow plan is edited in place, so the textarea holds a draft that starts
+  // from the latest version and is only sent when the user acts on it.
+  const [flowDraft, setFlowDraft] = useState('');
+  const [flowFeedback, setFlowFeedback] = useState('');
+  const [flowBusy, setFlowBusy] = useState(false);
+  const flowDirty = useRef(false);
 
   // Polling
   const pollHandle = useRef<NodeJS.Timeout | null>(null);
@@ -259,6 +277,65 @@ export default function PipelinePage() {
     }
   };
 
+  // The draft follows the newest version unless the user has started typing over
+  // it — losing someone's edits because a poll landed would be unforgivable.
+  const latestFlow = session?.flowPlanVersions?.[session.flowPlanVersions.length - 1];
+  useEffect(() => {
+    if (latestFlow && !flowDirty.current) setFlowDraft(latestFlow.text);
+  }, [latestFlow?.id]);
+
+  const flowPost = async (body: Record<string, unknown>) => {
+    if (!session) return;
+    setError(null);
+    setFlowBusy(true);
+    try {
+      const r = await authFetch(`${SERVER_BASE}/api/pipeline/${session.id}/flow`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      flowDirty.current = false;
+      setFlowDraft(data.version.text);
+      if (data.session) setSession(data.session);
+      setFlowFeedback('');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlowBusy(false);
+    }
+  };
+
+  const handleFlowRevise = () => flowPost({ feedback: flowFeedback });
+  const handleFlowSaveEdits = () => flowPost({ text: flowDraft });
+
+  const handleFlowApprove = async () => {
+    if (!session) return;
+    setError(null);
+    setFlowBusy(true);
+    try {
+      // Any unsaved edits are the intent, so they are committed before approving
+      // rather than silently discarded.
+      if (flowDirty.current && flowDraft.trim() && flowDraft !== latestFlow?.text) {
+        await flowPost({ text: flowDraft });
+      }
+      const r = await authFetch(`${SERVER_BASE}/api/pipeline/${session.id}/flow/approve`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ skipRecording: !recordSelected }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      setSession(data.session ?? data);
+      startPolling(session.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlowBusy(false);
+    }
+  };
+
   const handleReiterate = async () => {
     if (!session) return;
     setError(null);
@@ -333,8 +410,27 @@ export default function PipelinePage() {
 
         {session && <AgentBoard stages={session.stages} status={session.status} />}
 
-        {session && session.status !== 'READY' && session.status !== 'SCRIPT_DRAFT' && session.status !== 'ERROR' && (
-          <PreparingCard session={session} />
+        {session &&
+          session.status !== 'READY' &&
+          session.status !== 'SCRIPT_DRAFT' &&
+          session.status !== 'FLOW_REVIEW' &&
+          session.status !== 'ERROR' && <PreparingCard session={session} />}
+
+        {session && session.status === 'FLOW_REVIEW' && (
+          <FlowReviewCard
+            session={session}
+            draft={flowDraft}
+            setDraft={(v) => {
+              flowDirty.current = true;
+              setFlowDraft(v);
+            }}
+            feedback={flowFeedback}
+            setFeedback={setFlowFeedback}
+            busy={flowBusy}
+            onRevise={handleFlowRevise}
+            onSaveEdits={handleFlowSaveEdits}
+            onApprove={handleFlowApprove}
+          />
         )}
 
         {session && session.status === 'SCRIPT_DRAFT' && (
@@ -911,6 +1007,102 @@ function ResearchView({ research }: { research: NonNullable<Session['research']>
         </p>
       )}
     </div>
+  );
+}
+
+/**
+ * The walkthrough review gate.
+ *
+ * Shows what Pitchbox worked out the product is for and exactly what it intends
+ * to do on camera — including every value it will type — in a box the user can
+ * rewrite. Nothing is recorded until they confirm, because the alternative is
+ * finding out what the demo did after the video exists.
+ */
+function FlowReviewCard(props: {
+  session: Session;
+  draft: string;
+  setDraft: (v: string) => void;
+  feedback: string;
+  setFeedback: (v: string) => void;
+  busy: boolean;
+  onRevise: () => void;
+  onSaveEdits: () => void;
+  onApprove: () => void;
+}) {
+  const versions = props.session.flowPlanVersions ?? [];
+  const latest = versions[versions.length - 1];
+  const flowStage = props.session.stages.find((s) => s.id === 'flow');
+  const planning = !latest && flowStage?.status === 'running';
+
+  return (
+    <section className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-4 space-y-3">
+      <div className="flex items-baseline gap-3">
+        <h2 className="text-sm font-medium">Review the walkthrough</h2>
+        {latest && (
+          <span className="text-[11px] text-zinc-500">
+            v{latest.versionNumber}
+            {latest.editedByUser ? ' · your edits' : ''}
+          </span>
+        )}
+      </div>
+
+      <p className="text-[11px] text-zinc-500">
+        This is what Pitchbox will actually do on screen, and everything it will type. Edit it directly,
+        or describe what you want changed — then approve to record.
+      </p>
+
+      {planning && <p className="text-xs text-zinc-400">Exploring the product and working out the flow…</p>}
+
+      {flowStage?.status === 'failed' && (
+        <p className="text-xs text-amber-400">
+          Could not propose a flow ({flowStage.message}). Approving will let Pitchbox decide for itself.
+        </p>
+      )}
+
+      {latest && (
+        <textarea
+          value={props.draft}
+          onChange={(e) => props.setDraft(e.target.value)}
+          rows={16}
+          spellCheck={false}
+          className="w-full rounded bg-zinc-950 border border-zinc-800 p-2.5 text-xs font-mono leading-relaxed"
+        />
+      )}
+
+      <div className="space-y-1.5">
+        <label className="text-xs text-zinc-400">Changes you want</label>
+        <input
+          value={props.feedback}
+          onChange={(e) => props.setFeedback(e.target.value)}
+          placeholder="search for the nearest coffee shop, scroll to the end then back up, then update the search"
+          className="w-full rounded bg-zinc-950 border border-zinc-800 p-1.5 text-xs"
+        />
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 pt-1">
+        <button
+          onClick={props.onRevise}
+          disabled={props.busy || !props.feedback.trim()}
+          className="rounded border border-zinc-700 px-3 py-1.5 text-xs hover:bg-zinc-900 disabled:opacity-50"
+        >
+          {props.busy ? 'Working…' : 'Apply changes'}
+        </button>
+        <button
+          onClick={props.onSaveEdits}
+          disabled={props.busy || !props.draft.trim()}
+          className="rounded border border-zinc-700 px-3 py-1.5 text-xs hover:bg-zinc-900 disabled:opacity-50"
+        >
+          Save my edits
+        </button>
+        <button
+          onClick={props.onApprove}
+          disabled={props.busy}
+          className="ml-auto rounded bg-zinc-100 px-3 py-1.5 text-xs font-medium text-zinc-900 hover:bg-white disabled:opacity-50"
+        >
+          Approve &amp; record
+        </button>
+      </div>
+    </section>
   );
 }
 

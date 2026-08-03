@@ -17,6 +17,7 @@ export type PipelineStatus =
   | 'PLANNING'
   | 'RESEARCHING'
   | 'SCRIPT_DRAFT'
+  | 'FLOW_REVIEW'
   | 'GENERATING'
   | 'FUSING'
   | 'READY'
@@ -53,6 +54,25 @@ export interface ScriptVersion {
   parentVersionId?: string;
 }
 
+/**
+ * A proposed walkthrough, in prose, for the caller to read and edit.
+ *
+ * Versioned like the script: the planner's proposal, any revision it made from
+ * feedback, and any text the caller edited by hand are all kept, so approving is
+ * always approving something specific rather than whatever was last in a box.
+ */
+export interface FlowPlanVersion {
+  id: string;
+  versionNumber: number;
+  createdAt: string;
+  text: string;
+  /** What the caller asked to change, when this came from feedback. */
+  feedbackUsed?: string;
+  /** True when the caller wrote this text themselves rather than the planner. */
+  editedByUser?: boolean;
+  parentVersionId?: string;
+}
+
 export interface PipelineSession {
   id: string;
   /**
@@ -81,6 +101,8 @@ export interface PipelineSession {
   research?: ResearchArtifact;
   scriptVersions: ScriptVersion[];
   approvedVersionId?: string;
+  flowPlanVersions: FlowPlanVersion[];
+  approvedFlowPlanId?: string;
   audio?: {
     url: string;
     fileName: string;
@@ -160,6 +182,7 @@ export class SessionStore {
       input,
       stages,
       scriptVersions: [],
+      flowPlanVersions: [],
       workDir,
     };
     this.sessions.set(id, session);
@@ -194,6 +217,25 @@ export class SessionStore {
     };
     session.scriptVersions.push(version);
     session.status = 'SCRIPT_DRAFT';
+    session.updatedAt = version.createdAt;
+    return version;
+  }
+
+  appendFlowPlanVersion(
+    id: string,
+    payload: { text: string; feedbackUsed?: string; editedByUser?: boolean },
+  ): FlowPlanVersion {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error(`Session ${id} not found`);
+    const last = session.flowPlanVersions[session.flowPlanVersions.length - 1];
+    const version: FlowPlanVersion = {
+      id: randomUUID(),
+      versionNumber: (last?.versionNumber ?? 0) + 1,
+      createdAt: new Date().toISOString(),
+      parentVersionId: last?.id,
+      ...payload,
+    };
+    session.flowPlanVersions.push(version);
     session.updatedAt = version.createdAt;
     return version;
   }
