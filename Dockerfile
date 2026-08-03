@@ -21,6 +21,7 @@ ENV NODE_ENV=production \
 # System deps: ffmpeg, Chromium, and the libraries Chromium needs to launch.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ffmpeg chromium ca-certificates fonts-liberation dumb-init \
+      xvfb x11vnc \
       libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 \
       libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
       libpango-1.0-0 libpangocairo-1.0-0 libcairo2 \

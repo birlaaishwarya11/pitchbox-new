@@ -1,6 +1,7 @@
 // MUST be first: populates process.env before any env-reading import runs.
 import './loadEnv';
 import path from 'node:path';
+import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import express, { type Express, type Request, type Response } from 'express';
 import cors from 'cors';
@@ -11,6 +12,8 @@ import { DaytonaDeployer, DaytonaDeploymentError } from './DaytonaDeployer';
 import { SandboxRecorder } from './SandboxRecorder';
 import { Recorder, RecorderError } from './Recorder';
 import { SiteScout } from './SiteScout';
+import { InteractiveLoginManager } from './InteractiveLogin';
+import { attachLoginSocket, loginViewerHtml } from './loginViewer';
 import { RepositoryCloner, RepositoryClonerError } from './RepositoryCloner';
 import { CodebaseAnalyzer } from './CodebaseAnalyzer';
 import { FlowExtractor } from './FlowExtractor';
@@ -44,6 +47,9 @@ const recorder = new Recorder();
 // Explores a target app before the camera rolls, so the recording can show the
 // product being used rather than a tour of its front page.
 const siteScout = new SiteScout();
+// Hands a caller a real browser to sign into, so Pitchbox never handles anyone's
+// credentials. Linux-only (Xvfb + x11vnc); elsewhere the login gate is skipped.
+const interactiveLogin = new InteractiveLoginManager();
 const repositoryCloner = new RepositoryCloner();
 const codebaseAnalyzer = new CodebaseAnalyzer();
 const flowExtractor = new FlowExtractor();
@@ -113,6 +119,7 @@ const orchestrator = new PipelineOrchestrator({
   // Records a deployed/public URL directly (no Daytona required).
   urlRecorder: recorder,
   siteScout,
+  interactiveLogin,
   // Records a GitHub repo by building + running it inside a Daytona sandbox.
   sandboxRecorder: sandboxRecorder ?? undefined,
   publicMediaPrefix: '/sessions',
@@ -893,6 +900,73 @@ app.post('/api/pipeline/:id/flow/approve', auth, async (req: Request, res: Respo
   }
 });
 
+/**
+ * Open a browser the caller signs into themselves.
+ *
+ * Pitchbox never asks for or stores a credential: the person drives a real
+ * browser, so OAuth, SSO, two-factor, a magic link and a captcha all just work,
+ * and whatever they sign into is what gets explored and filmed.
+ */
+app.post('/api/pipeline/:id/login/start', auth, async (req: Request, res: Response) => {
+  const session = getOwnedSession(req, res);
+  if (!session) return;
+
+  const unsupported = await InteractiveLoginManager.unsupportedReason();
+  if (unsupported) {
+    res.status(503).json({ error: unsupported, code: 'LOGIN_UNSUPPORTED' });
+    return;
+  }
+  if (!session.input.recordUrl) {
+    res.status(400).json({ error: 'Interactive login applies to a `recordUrl` run.', code: 'NO_URL' });
+    return;
+  }
+
+  try {
+    const view = await interactiveLogin.start(req.params.id, session.input.recordUrl);
+    // The token is returned once, to the authenticated owner. It is what guards
+    // the viewer and its socket — there is a live browser behind them.
+    res.json({
+      viewerUrl: `/api/pipeline/${encodeURIComponent(req.params.id)}/login/viewer?token=${encodeURIComponent(view.token)}`,
+      expiresAt: view.expiresAt,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** The browser-in-a-browser view. Token-gated; see loginViewer.ts. */
+app.get('/api/pipeline/:id/login/viewer', (req: Request, res: Response) => {
+  const token = typeof req.query.token === 'string' ? req.query.token : undefined;
+  const login = interactiveLogin.authorise(req.params.id, token);
+  if (!login) {
+    res.status(403).type('text/plain').send('Not available.');
+    return;
+  }
+  res.type('html').send(loginViewerHtml(req.params.id, login.token));
+});
+
+/** The caller has signed in; explore and record in that same browser. */
+app.post('/api/pipeline/:id/login/confirm', auth, async (req: Request, res: Response) => {
+  if (!getOwnedSession(req, res)) return;
+  try {
+    const updated = await orchestrator.confirmLogin(req.params.id);
+    res.status(202).json(redactSession(updated));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Give up on signing in; carry on with whatever is reachable without it. */
+app.post('/api/pipeline/:id/login/cancel', auth, async (req: Request, res: Response) => {
+  if (!getOwnedSession(req, res)) return;
+  try {
+    await orchestrator.cancelLogin(req.params.id);
+    res.status(202).json(redactSession(sessionStore.get(req.params.id)));
+  } catch (error) {
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
 app.post('/api/pipeline/:id/reiterate', auth, (req: Request, res: Response) => {
   if (!getOwnedSession(req, res)) return;
   try {
@@ -911,7 +985,35 @@ function redactSession(session: ReturnType<SessionStore['get']>) {
   return rest;
 }
 
-app.listen(PORT, () => {
+// noVNC's client, served straight from the installed package: one page does not
+// justify a bundler step.
+app.use(
+  '/novnc',
+  express.static(path.join(process.cwd(), '..', '..', 'node_modules', '@novnc', 'novnc'), {
+    // Immutable versioned assets; long cache is safe and keeps the viewer snappy.
+    maxAge: '1h',
+    index: false,
+  }),
+);
+
+const httpServer = http.createServer(app);
+
+// The websocket upgrade never reaches Express middleware, so the login socket
+// authorises itself against the run's token inside the upgrade handler.
+attachLoginSocket(httpServer, {
+  manager: interactiveLogin,
+  ownsSession: () => true,
+});
+
+// A login browser holds an X display, a VNC server and somebody's live session,
+// so none of them should outlive the process.
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.once(signal, () => {
+    void interactiveLogin.stopAll().finally(() => process.exit(0));
+  });
+}
+
+httpServer.listen(PORT, () => {
   console.log(`🚀 Server is running on http://localhost:${PORT}`);
 
   if (ALLOW_SERVER_KEYS) {

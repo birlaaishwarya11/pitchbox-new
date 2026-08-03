@@ -9,6 +9,8 @@ import { Scripter } from './Scripter';
 import { Director } from './Director';
 import { FlowPlanner } from './FlowPlanner';
 import type { SiteScout } from './SiteScout';
+import type { InteractiveLoginManager } from './InteractiveLogin';
+import type { Browser } from 'puppeteer';
 import { makeDummyIdentity, type DummyIdentity } from './cinematics/dummyIdentity';
 import type { Beat, SerializedCookie, SiteMap } from './cinematics/types';
 import { createLlmClient, type LlmConfig } from './llm/createLlmClient';
@@ -90,6 +92,10 @@ export interface PipelineDeps {
   // point beyond the landing page. Optional: without it, recording degrades to
   // the old scroll-the-front-page behaviour rather than failing.
   siteScout?: SiteScout;
+  // Hands the caller a driveable browser so they can sign in themselves. Absent
+  // on a host without a virtual display, in which case the login gate is skipped
+  // and the walkthrough covers whatever is reachable signed out.
+  interactiveLogin?: InteractiveLoginManager;
   // Renders a branded slate PNG when there is no screen recording.
   slateRenderer?: SlateRenderer;
   // Public URL prefix for static-served session files. Final URLs become
@@ -162,6 +168,18 @@ export class PipelineOrchestrator {
    * that dumps a session. Off to the side, only the recording stage can see them.
    */
   private readonly appEnvBySession = new Map<string, Record<string, string>>();
+  /**
+   * Browsers a caller signed into by hand, waiting to be explored and filmed.
+   *
+   * Held here rather than on the session because a live browser is not
+   * serialisable and must never reach an API response. The whole point is that
+   * the browser signed into is the one recorded, so it lives for the rest of the
+   * run and is shut down once the media stages are done.
+   */
+  private readonly loginBrowserBySession = new Map<
+    string,
+    { browser: Browser; display: string; shutdown: () => Promise<void> }
+  >();
 
   constructor(private readonly deps: PipelineDeps) {}
 
@@ -274,6 +292,19 @@ export class PipelineOrchestrator {
       s.error = undefined;
     });
 
+    const loginSelected = session.stages.find((s) => s.id === 'login')?.status !== 'skipped';
+    if (this.willRecord(session, options) && loginSelected && this.deps.interactiveLogin) {
+      void this.beginLogin(sessionId).catch((err) => {
+        console.error(`[pipeline ${sessionId}] login-browser failure:`, err);
+        this.deps.store.setStage(sessionId, 'login', { status: 'failed', message: String(err?.message ?? err) });
+        // A login we could not offer must not strand the run: fall through to
+        // planning the flow from whatever is reachable without one.
+        void this.afterLogin(sessionId).catch(() => undefined);
+      });
+      return this.requireSession(sessionId);
+    }
+    this.deps.store.skipStage(sessionId, 'login');
+
     const flowSelected = session.stages.find((s) => s.id === 'flow')?.status !== 'skipped';
     if (this.willRecord(session, options) && flowSelected) {
       this.deps.store.setStatus(sessionId, 'FLOW_REVIEW');
@@ -289,6 +320,81 @@ export class PipelineOrchestrator {
 
     this.deps.store.skipStage(sessionId, 'flow');
     return this.startMediaStages(sessionId, options);
+  }
+
+  /**
+   * Open a browser for the caller to sign into, and wait.
+   *
+   * No timeout beyond the browser's own idle reclaim: somebody may need to fetch
+   * a phone for a second factor, and a run that gave up while they did would be
+   * worse than one that waits.
+   */
+  private async beginLogin(sessionId: string): Promise<void> {
+    const session = this.requireSession(sessionId);
+    const manager = this.deps.interactiveLogin;
+    const target = session.input.recordUrl;
+    if (!manager || !target) {
+      this.deps.store.skipStage(sessionId, 'login');
+      await this.afterLogin(sessionId);
+      return;
+    }
+
+    const store = this.deps.store;
+    store.setStage(sessionId, 'login', { status: 'running', message: 'opening a browser for you…' });
+    store.setStatus(sessionId, 'AWAITING_LOGIN');
+    await manager.start(sessionId, target);
+    store.setStage(sessionId, 'login', {
+      status: 'running',
+      message: 'waiting for you to sign in',
+    });
+  }
+
+  /** The caller says they are signed in. Take the browser and carry on. */
+  async confirmLogin(sessionId: string): Promise<PipelineSession> {
+    const manager = this.deps.interactiveLogin;
+    const released = manager?.release(sessionId);
+    if (released) {
+      this.loginBrowserBySession.set(sessionId, released);
+      this.deps.store.setStage(sessionId, 'login', { status: 'done', message: 'signed in by you' });
+      console.log(`[pipeline ${sessionId}] took over the signed-in browser on ${released.display}`);
+    } else {
+      this.deps.store.setStage(sessionId, 'login', { status: 'skipped', message: 'no login browser was open' });
+    }
+
+    void this.afterLogin(sessionId).catch((err) => {
+      console.error(`[pipeline ${sessionId}] flow-plan failure after login:`, err);
+      this.deps.store.setStage(sessionId, 'flow', { status: 'failed', message: String(err?.message ?? err) });
+      this.deps.store.setStatus(sessionId, 'FLOW_REVIEW');
+    });
+    return this.requireSession(sessionId);
+  }
+
+  /** Abandon a login browser without recording, e.g. the caller gave up. */
+  async cancelLogin(sessionId: string): Promise<void> {
+    await this.deps.interactiveLogin?.stop(sessionId);
+    const held = this.loginBrowserBySession.get(sessionId);
+    if (held) {
+      this.loginBrowserBySession.delete(sessionId);
+      await held.shutdown().catch(() => undefined);
+    }
+    this.deps.store.setStage(sessionId, 'login', { status: 'skipped', message: 'cancelled' });
+  }
+
+  /** Continue into the flow gate once the login question is settled. */
+  private async afterLogin(sessionId: string): Promise<void> {
+    const session = this.requireSession(sessionId);
+    const approved =
+      session.scriptVersions.find((v) => v.id === session.approvedVersionId) ??
+      session.scriptVersions[session.scriptVersions.length - 1];
+    if (!approved) throw new Error('No approved script');
+
+    const flowSelected = session.stages.find((s) => s.id === 'flow')?.status !== 'skipped';
+    if (!flowSelected) {
+      this.startMediaStages(sessionId, {});
+      return;
+    }
+    this.deps.store.setStatus(sessionId, 'FLOW_REVIEW');
+    await this.proposeFlowPlan(sessionId, approved);
   }
 
   /** True when this run has somewhere to point a camera. */
@@ -317,7 +423,10 @@ export class PipelineOrchestrator {
     // the prompt and script alone and refined by the director in there.
     let siteMap = this.siteMapBySession.get(sessionId);
     if (!siteMap && scout && target) {
-      siteMap = await scout.explore(target, makeDummyIdentity(`${sessionId}:scout`));
+      // Explore in the browser the caller signed into, when there is one — the
+      // map has to be of the authenticated product, not the login wall.
+      const signedIn = this.loginBrowserBySession.get(sessionId);
+      siteMap = await scout.explore(target, makeDummyIdentity(`${sessionId}:scout`), signedIn?.browser);
       this.siteMapBySession.set(sessionId, siteMap);
       console.log(
         `[pipeline ${sessionId}] scouted ${siteMap.screens.length} screen(s) for the flow plan: ` +
@@ -551,6 +660,15 @@ export class PipelineOrchestrator {
       await this.runMediaStagesInner(sessionId, approvedScript, options);
     } finally {
       release();
+      // The signed-in browser exists for this run only. Held open past it, it
+      // keeps an X display, a VNC server and somebody's live session alive.
+      const held = this.loginBrowserBySession.get(sessionId);
+      if (held) {
+        this.loginBrowserBySession.delete(sessionId);
+        await held.shutdown().catch((err) => {
+          console.warn(`[pipeline ${sessionId}] could not close the signed-in browser:`, err);
+        });
+      }
     }
   }
 
@@ -811,7 +929,12 @@ export class PipelineOrchestrator {
       let siteMap = this.siteMapBySession.get(session.id);
       if (!siteMap) {
         store.setStage(session.id, 'record', { status: 'running', message: 'exploring the app…' });
-        siteMap = await scout.explore(recordUrl, makeDummyIdentity(`${session.id}:scout`));
+        const signedIn = this.loginBrowserBySession.get(session.id);
+        siteMap = await scout.explore(
+          recordUrl,
+          makeDummyIdentity(`${session.id}:scout`),
+          signedIn?.browser,
+        );
         this.siteMapBySession.set(session.id, siteMap);
         console.log(
           `[pipeline ${session.id}] scouted ${siteMap.screens.length} screen(s): ` +
@@ -870,6 +993,7 @@ export class PipelineOrchestrator {
     recordCeilingMs: number,
   ): Promise<string> {
     if (session.input.recordUrl && this.deps.urlRecorder) {
+      const signedInBrowser = this.loginBrowserBySession.get(session.id);
       const approved =
         session.scriptVersions.find((v) => v.id === session.approvedVersionId) ??
         session.scriptVersions[session.scriptVersions.length - 1];
@@ -889,6 +1013,10 @@ export class PipelineOrchestrator {
       const rec = await withTimeout(
         this.deps.urlRecorder.record(session.input.recordUrl, {
           targetDurationMs: recordDurationMs,
+          // Film the browser the caller signed into, on the display they were
+          // watching. Recording anywhere else captures a signed-out session.
+          browser: signedInBrowser?.browser,
+          display: signedInBrowser?.display,
           // Empty beats fall back to scrolling inside the recorder — a worse
           // video, not a broken one.
           beats,

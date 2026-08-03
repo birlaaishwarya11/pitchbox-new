@@ -17,6 +17,7 @@ export type PipelineStatus =
   | 'PLANNING'
   | 'RESEARCHING'
   | 'SCRIPT_DRAFT'
+  | 'AWAITING_LOGIN'
   | 'FLOW_REVIEW'
   | 'GENERATING'
   | 'FUSING'

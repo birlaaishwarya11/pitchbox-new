@@ -21,7 +21,7 @@ async function authFetch(input: string, init: RequestInit = {}): Promise<Respons
   return fetch(input, { ...init, headers });
 }
 
-type Status = 'CREATED' | 'PLANNING' | 'RESEARCHING' | 'SCRIPT_DRAFT' | 'FLOW_REVIEW' | 'GENERATING' | 'FUSING' | 'READY' | 'ERROR';
+type Status = 'CREATED' | 'PLANNING' | 'RESEARCHING' | 'SCRIPT_DRAFT' | 'AWAITING_LOGIN' | 'FLOW_REVIEW' | 'GENERATING' | 'FUSING' | 'READY' | 'ERROR';
 
 type LlmCfg = { provider: string; apiKey: string; model: string };
 type ProviderInfo = {
@@ -32,7 +32,7 @@ type ProviderInfo = {
   models: { id: string; label: string; free?: boolean }[];
 };
 
-type StageId = 'analyze' | 'plan' | 'research' | 'script' | 'flow' | 'record' | 'voiceover' | 'fuse';
+type StageId = 'analyze' | 'plan' | 'research' | 'script' | 'login' | 'flow' | 'record' | 'voiceover' | 'fuse';
 type StageStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
 type StageState = {
   id: StageId;
@@ -173,6 +173,8 @@ export default function PipelinePage() {
   const [flowFeedback, setFlowFeedback] = useState('');
   const [flowBusy, setFlowBusy] = useState(false);
   const flowDirty = useRef(false);
+  const [loginViewer, setLoginViewer] = useState<string | null>(null);
+  const [loginBusy, setLoginBusy] = useState(false);
 
   // Polling
   const pollHandle = useRef<NodeJS.Timeout | null>(null);
@@ -336,6 +338,47 @@ export default function PipelinePage() {
     }
   };
 
+  // Ask for a browser to sign into as soon as the run parks for it, so the user
+  // is not left looking at a spinner wondering what it wants.
+  useEffect(() => {
+    if (session?.status !== 'AWAITING_LOGIN' || loginViewer || loginBusy) return;
+    let cancelled = false;
+    (async () => {
+      setLoginBusy(true);
+      try {
+        const r = await authFetch(`${SERVER_BASE}/api/pipeline/${session.id}/login/start`, { method: 'POST' });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+        if (!cancelled) setLoginViewer(`${SERVER_BASE}${data.viewerUrl}`);
+      } catch (e) {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!cancelled) setLoginBusy(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.status, session?.id]);
+
+  const loginPost = async (action: 'confirm' | 'cancel') => {
+    if (!session) return;
+    setError(null);
+    setLoginBusy(true);
+    try {
+      const r = await authFetch(`${SERVER_BASE}/api/pipeline/${session.id}/login/${action}`, { method: 'POST' });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      setLoginViewer(null);
+      setSession(data);
+      startPolling(session.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoginBusy(false);
+    }
+  };
+
   const handleReiterate = async () => {
     if (!session) return;
     setError(null);
@@ -413,8 +456,19 @@ export default function PipelinePage() {
         {session &&
           session.status !== 'READY' &&
           session.status !== 'SCRIPT_DRAFT' &&
+          session.status !== 'AWAITING_LOGIN' &&
           session.status !== 'FLOW_REVIEW' &&
           session.status !== 'ERROR' && <PreparingCard session={session} />}
+
+        {session && session.status === 'AWAITING_LOGIN' && (
+          <LoginGateCard
+            session={session}
+            viewerUrl={loginViewer}
+            busy={loginBusy}
+            onConfirm={() => loginPost('confirm')}
+            onSkip={() => loginPost('cancel')}
+          />
+        )}
 
         {session && session.status === 'FLOW_REVIEW' && (
           <FlowReviewCard
@@ -1018,6 +1072,75 @@ function ResearchView({ research }: { research: NonNullable<Session['research']>
  * rewrite. Nothing is recorded until they confirm, because the alternative is
  * finding out what the demo did after the video exists.
  */
+/**
+ * The sign-in gate.
+ *
+ * A real browser, running on the server, embedded here for the user to drive.
+ * They sign in however the site asks — password, OAuth, SSO, a code from their
+ * phone — and Pitchbox never sees a credential. The browser they use is the one
+ * that then gets explored and filmed, so whatever they reach is what the demo
+ * shows.
+ */
+function LoginGateCard(props: {
+  session: Session;
+  viewerUrl: string | null;
+  busy: boolean;
+  onConfirm: () => void;
+  onSkip: () => void;
+}) {
+  const stage = props.session.stages.find((s) => s.id === 'login');
+  const failed = stage?.status === 'failed';
+
+  return (
+    <section className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-4 space-y-3">
+      <h2 className="text-sm font-medium">Sign in to the site being recorded</h2>
+      <p className="text-[11px] text-zinc-500">
+        This is a real browser running on the server. Sign in however the site asks — password, Google,
+        SSO, a code from your phone. Pitchbox never sees your credentials. Whatever you reach here is
+        what gets explored and recorded.
+      </p>
+
+      {failed && (
+        <p className="text-xs text-amber-400">
+          Could not open a browser ({stage?.message}). Continue without signing in and the demo will
+          cover whatever is reachable publicly.
+        </p>
+      )}
+
+      {props.viewerUrl ? (
+        <iframe
+          src={props.viewerUrl}
+          title="Sign in to the site being recorded"
+          className="w-full rounded border border-zinc-800 bg-black"
+          style={{ height: 460 }}
+          // The frame drives a browser holding the user's session; nothing in it
+          // needs access to this page.
+          sandbox="allow-scripts allow-same-origin allow-forms"
+        />
+      ) : (
+        !failed && <p className="text-xs text-zinc-400">Opening a browser for you…</p>
+      )}
+
+      <div className="flex items-center gap-2 pt-1">
+        <button
+          onClick={props.onSkip}
+          disabled={props.busy}
+          className="rounded border border-zinc-700 px-3 py-1.5 text-xs hover:bg-zinc-900 disabled:opacity-50"
+        >
+          Continue without signing in
+        </button>
+        <button
+          onClick={props.onConfirm}
+          disabled={props.busy || (!props.viewerUrl && !failed)}
+          className="ml-auto rounded bg-zinc-100 px-3 py-1.5 text-xs font-medium text-zinc-900 hover:bg-white disabled:opacity-50"
+        >
+          {props.busy ? 'Working…' : "I'm signed in"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
 function FlowReviewCard(props: {
   session: Session;
   draft: string;

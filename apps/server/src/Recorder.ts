@@ -439,6 +439,14 @@ export class Recorder {
        * borrowed browser is never closed here.
        */
       browser?: Browser;
+      /**
+       * Capture this existing X display instead of starting one.
+       *
+       * Used with `browser`: the login browser is already on a display that the
+       * user has been watching, and the recording has to grab that same one.
+       * Starting a second display would film an empty desktop.
+       */
+      display?: string;
     } = {},
   ): Promise<RecordingResult> {
     const url = this.normalizeUrl(rawUrl);
@@ -458,6 +466,7 @@ export class Recorder {
           options.identity,
           options.authCookies,
           options.browser,
+          options.display,
         );
       } else {
         await this.recordWithScreenshots(
@@ -522,14 +531,17 @@ export class Recorder {
     identity?: DummyIdentity,
     authCookies?: SerializedCookie[],
     existingBrowser?: Browser,
+    existingDisplay?: string,
   ): Promise<void> {
     let virtualDisplay: VirtualDisplaySession | undefined;
     let ffmpegProcess: ChildProcessWithoutNullStreams | undefined;
     let browser: Browser | undefined;
 
     try {
-      virtualDisplay = await this.startVirtualDisplay();
-      const ffmpegDisplay = virtualDisplay.display;
+      // A display we were handed is the user's login session; we film it and
+      // leave its lifecycle to whoever set it up.
+      if (!existingDisplay) virtualDisplay = await this.startVirtualDisplay();
+      const ffmpegDisplay = existingDisplay ?? virtualDisplay!.display;
 
       ffmpegProcess = this.spawnFfmpegX11(ffmpegDisplay, tmpOutput);
       await this.waitForProcessSpawn(ffmpegProcess);
@@ -568,7 +580,9 @@ export class Recorder {
       if (!existingBrowser) await browser.close();
       browser = undefined;
 
-      await virtualDisplay.stop();
+      // Only stop a display we started. A borrowed one is the user's login
+      // session and its owner decides when it goes away.
+      await virtualDisplay?.stop();
       virtualDisplay = undefined;
 
       // The exit code cannot say whether this worked (see stopProcess), so the
