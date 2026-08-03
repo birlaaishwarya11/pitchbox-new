@@ -1000,8 +1000,14 @@ function redactSession(session: ReturnType<SessionStore['get']>) {
 const novncDir = (() => {
   try {
     const require_ = createRequire(import.meta.url);
-    return path.dirname(require_.resolve('@novnc/novnc/package.json'));
-  } catch {
+    // Resolve the bare specifier, not a subpath. The package declares
+    // `exports: "./core/rfb.js"`, which exports the root and nothing else — so
+    // asking for `@novnc/novnc/package.json` fails with
+    // ERR_PACKAGE_PATH_NOT_EXPORTED and the viewer silently loses its client.
+    // The root resolves to core/rfb.js, so the package directory is two up.
+    return path.resolve(path.dirname(require_.resolve('@novnc/novnc')), '..');
+  } catch (err) {
+    console.warn('[server] could not locate @novnc/novnc:', err instanceof Error ? err.message : err);
     return undefined;
   }
 })();
