@@ -430,6 +430,15 @@ export class Recorder {
        * session that already worked is just a handful of cookies.
        */
       authCookies?: SerializedCookie[];
+      /**
+       * Record in a browser the caller owns rather than a fresh one.
+       *
+       * This is what makes a human-driven login usable: the person signs in, and
+       * the recording is taken from that same authenticated browser. Anything
+       * else records a different session from the one that was logged into. A
+       * borrowed browser is never closed here.
+       */
+      browser?: Browser;
     } = {},
   ): Promise<RecordingResult> {
     const url = this.normalizeUrl(rawUrl);
@@ -448,6 +457,7 @@ export class Recorder {
           options.beats,
           options.identity,
           options.authCookies,
+          options.browser,
         );
       } else {
         await this.recordWithScreenshots(
@@ -457,6 +467,7 @@ export class Recorder {
           options.beats,
           options.identity,
           options.authCookies,
+          options.browser,
         );
       }
 
@@ -510,6 +521,7 @@ export class Recorder {
     beats?: Beat[],
     identity?: DummyIdentity,
     authCookies?: SerializedCookie[],
+    existingBrowser?: Browser,
   ): Promise<void> {
     let virtualDisplay: VirtualDisplaySession | undefined;
     let ffmpegProcess: ChildProcessWithoutNullStreams | undefined;
@@ -522,7 +534,9 @@ export class Recorder {
       ffmpegProcess = this.spawnFfmpegX11(ffmpegDisplay, tmpOutput);
       await this.waitForProcessSpawn(ffmpegProcess);
 
-      browser = await this.launchBrowserHeaded(ffmpegDisplay);
+      // A borrowed browser is already on the display the caller set up, so it is
+      // used as-is rather than launched onto ours.
+      browser = existingBrowser ?? (await this.launchBrowserHeaded(ffmpegDisplay));
       const page = await browser.newPage();
       await this.applyAuthCookies(page, authCookies);
       await this.preparePage(page, url);
@@ -551,7 +565,7 @@ export class Recorder {
       await this.stopProcess(ffmpegProcess);
       ffmpegProcess = undefined;
 
-      await browser.close();
+      if (!existingBrowser) await browser.close();
       browser = undefined;
 
       await virtualDisplay.stop();
@@ -588,6 +602,7 @@ export class Recorder {
     beats?: Beat[],
     identity?: DummyIdentity,
     authCookies?: SerializedCookie[],
+    existingBrowser?: Browser,
   ): Promise<void> {
     let ffmpegProcess: ChildProcessWithoutNullStreams | undefined;
     let browser: Browser | undefined;
@@ -608,7 +623,7 @@ export class Recorder {
         capturing = false;
       });
 
-      browser = await this.launchBrowserHeadless();
+      browser = existingBrowser ?? (await this.launchBrowserHeadless());
       const page = await browser.newPage();
       await page.setViewport({ width: this.viewport.width, height: this.viewport.height });
       await this.applyAuthCookies(page, authCookies);
@@ -642,10 +657,12 @@ export class Recorder {
       // never fire before the requested footage has been captured.
       const scrollBudgetMs = this.scroll.maxScrollMs + this.scroll.tailWaitMs;
       const hardCapMs = Math.max(scrollBudgetMs, targetDurationMs ?? 0) + 10_000;
-      const capturingBrowser = browser;
+      const capturingBrowser = existingBrowser ? undefined : browser;
       watchdog = setTimeout(() => {
         capturing = false;
-        capturingBrowser.close().catch(() => undefined);
+        // Only ever force-close a browser we own. Killing a borrowed one would
+        // destroy the human's session and the run it belongs to.
+        capturingBrowser?.close().catch(() => undefined);
       }, hardCapMs);
       watchdog.unref?.();
 
@@ -788,8 +805,9 @@ export class Recorder {
       }
 
       // The watchdog may have already closed the browser; close() is safe to
-      // call again but can reject, so swallow it.
-      await browser.close().catch(() => undefined);
+      // call again but can reject, so swallow it. A borrowed browser is left
+      // alone — its owner decides when it dies.
+      if (!existingBrowser) await browser.close().catch(() => undefined);
       browser = undefined;
 
       await this.waitForClose(ffmpegProcess);
@@ -802,7 +820,7 @@ export class Recorder {
       if (ffmpegProcess) {
         ffmpegProcess.kill('SIGKILL');
       }
-      if (browser) {
+      if (browser && !existingBrowser) {
         await browser.close().catch(() => undefined);
       }
     }

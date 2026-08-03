@@ -106,7 +106,18 @@ export class SiteScout {
    * runs inside the recording stage's own timeout. Whatever was harvested
    * before the deadline is still returned — a partial map beats none.
    */
-  async explore(entryUrl: string, identity: DummyIdentity): Promise<SiteMap> {
+  /**
+   * @param existingBrowser Explore in a browser the caller owns, rather than a
+   *   fresh one. This is how a human-driven login reaches the rest of the
+   *   pipeline: the person signs in, and the map is then built from inside the
+   *   authenticated product using that same session. A browser passed in is not
+   *   closed here — it belongs to the caller.
+   */
+  async explore(
+    entryUrl: string,
+    identity: DummyIdentity,
+    existingBrowser?: Browser,
+  ): Promise<SiteMap> {
     const entry = new URL(entryUrl);
     const deadline = Date.now() + this.budgetMs;
     const notes: string[] = [];
@@ -128,18 +139,22 @@ export class SiteScout {
     };
 
     const run = async (): Promise<void> => {
-      browser = await puppeteer.launch({
-        headless: true,
-        defaultViewport: this.viewport,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--hide-scrollbars',
-          `--window-size=${this.viewport.width},${this.viewport.height}`,
-        ],
-        timeout: this.navigationTimeoutMs,
-      });
+      if (existingBrowser) {
+        browser = existingBrowser;
+      } else {
+        browser = await puppeteer.launch({
+          headless: true,
+          defaultViewport: this.viewport,
+          args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--hide-scrollbars',
+            `--window-size=${this.viewport.width},${this.viewport.height}`,
+          ],
+          timeout: this.navigationTimeoutMs,
+        });
+      }
       const page = await browser.newPage();
       await page.setViewport(this.viewport);
       await this.installShim(page);
@@ -250,8 +265,10 @@ export class SiteScout {
     if (outcome === timedOut) notes.push('Exploration stopped early: time budget reached.');
     else if (failure) notes.push(`Exploration ended early: ${describe(failure)}`);
 
-    // Closing the browser unblocks whatever step the race abandoned mid-flight.
-    if (browser) await browser.close().catch(() => undefined);
+    // Closing unblocks whatever step the race abandoned mid-flight — but only a
+    // browser we launched. One that was lent to us is still needed by its owner,
+    // and closing it would throw away the session the human just established.
+    if (browser && !existingBrowser) await browser.close().catch(() => undefined);
 
     return finish();
   }
