@@ -78,6 +78,11 @@ const FORBIDDEN_TEXT =
  * but by the code that understands them as forms.
  */
 const ACTION_TEXT = /^(add|create|save|submit|send|update|post|upload|generate|run|apply|confirm|invite|new)\b/i;
+/**
+ * Federated-login controls. Clicking one hands the browser to an identity
+ * provider, which is off-origin by definition and unusable by a dummy persona.
+ */
+const OAUTH_TEXT = /(continue|sign\s*in|sign\s*up|log\s*in)\s+with\s+\w|with\s+(google|github|gitlab|apple|microsoft|facebook|twitter|x|discord|slack|okta|sso)\b/i;
 
 export class SiteScout {
   private readonly viewport: { width: number; height: number };
@@ -287,9 +292,24 @@ export class SiteScout {
       // Still staring at the same form means it was rejected — a validation
       // error, an email that already exists, a captcha. Worth saying so.
       if (landed.path === authScreen.path && pickFillableForm(landed.forms)) {
+        // Read the app's own complaint where it gives one: the two common causes
+        // are a rejected address and a confirmation step, and they need different
+        // fixes from whoever is running this.
+        const shown = await page
+          .evaluate(() => (document.body?.innerText ?? '').replace(/\s+/g, ' ').slice(0, 400))
+          .catch(() => '');
+        const emailRejected = /e-?mail[^.]{0,40}(invalid|not valid|not allowed|unsupported)/i.test(shown);
+        const needsConfirm = /(confirm|verify)[^.]{0,30}(e-?mail|inbox)|check your (e-?mail|inbox)/i.test(shown);
+
         notes.push(
-          `The ${door.kind} form did not go through (still on ${landed.path}) — the app may require ` +
-            'email confirmation, a captcha, or an invite.',
+          `The ${door.kind} form did not go through (still on ${landed.path}).` +
+            (emailRejected
+              ? ' The app rejected the dummy email address. example.com is reserved and many' +
+                ' validators refuse it — set PITCHBOX_DEMO_EMAIL_DOMAIN to a domain you control.'
+              : needsConfirm
+                ? ' The app requires email confirmation, so the walkthrough cannot get past the login.'
+                : ' The app may require email confirmation, a captcha, or an invite.') +
+            (shown ? ` It said: ${shown.slice(0, 160)}` : ''),
         );
       }
       out.push(landed);
@@ -349,6 +369,7 @@ export class SiteScout {
       if (tried.has(b.selector) || FORBIDDEN_TEXT.test(b.text)) return false;
       // The way into the product outranks the action-word exclusion: "Start
       // free" and "Create an account" are doors, not buttons on a form.
+      if (OAUTH_TEXT.test(b.text)) return false;
       return SIGNUP_TEXT.test(b.text) || !ACTION_TEXT.test(b.text);
     });
     if (!usable.length) return null;
@@ -385,8 +406,24 @@ export class SiteScout {
     const form = pickFillableForm(screen.forms);
     if (!form || Date.now() >= deadline) return [screen];
 
+    // Fill it, but never submit a credential form from here.
+    //
+    // A form with a password field is a sign-in, and a dummy persona has no
+    // account to sign in with — submitting it cannot succeed by construction, it
+    // can only produce "Invalid login credentials". That error then became the
+    // screen the director framed, and a showcase video ended on a red failure
+    // box. Signing up is `attemptAuth`'s job: it knows to prefer registration
+    // over authentication and reports why when it is refused.
+    const isCredentialForm = form.fields.some((f) => f.kind === 'password');
     try {
       await this.fillForm(page, form, identity);
+      if (isCredentialForm) {
+        notes.push(
+          `Filled the credential form on ${screen.path} but did not submit it — a dummy persona has no ` +
+            'existing account, so signing in could only fail. Signup is attempted separately.',
+        );
+        return [screen];
+      }
       if (!(await this.submitForm(page, form))) return [screen];
       await this.settle(page, 2_000);
       const result = await this.harvest(
@@ -420,12 +457,29 @@ export class SiteScout {
     try {
       await page.click(selector, { delay: 20 });
       await this.settle(page, 1_800);
+
+      // A click can navigate anywhere, and the origin check above only guards
+      // candidates that had an href to check. A "Continue with GitHub" button
+      // calls signInWithOAuth and leaves for the identity provider, which is how
+      // a scout of a logged-out app ended up harvesting a Supabase OAuth consent
+      // screen — a third party's page, one screen of budget wasted, and the last
+      // thing anyone wants appearing in their product demo.
+      if (!this.isSameOrigin(page.url(), entry)) {
+        await page
+          .goto(before, { waitUntil: 'domcontentloaded', timeout: this.navigationTimeoutMs })
+          .catch(() => undefined);
+        throw new Error(`clicking ${selector} left ${entry.origin}`);
+      }
+
       if (page.url() !== before) return;
       // An SPA router swaps the DOM without touching the URL, so a changed
       // page signature is the only evidence the click went anywhere.
       if ((await this.pageSignature(page)) !== beforeSignature) return;
-    } catch {
-      /* fall through to a direct navigation, if we have somewhere to go */
+    } catch (error) {
+      // Leaving the origin is a decision, not a hiccup: do not then try to reach
+      // the same place by direct navigation.
+      if (error instanceof Error && error.message.includes('left ')) throw error;
+      /* otherwise fall through to a direct navigation, if we have somewhere to go */
     }
 
     if (!target) throw new Error(`clicking ${selector} did not lead anywhere`);
@@ -435,6 +489,15 @@ export class SiteScout {
       timeout: this.navigationTimeoutMs,
     });
     await this.settle(page);
+  }
+
+  /** True when `candidate` is on the origin the caller authorised. */
+  private isSameOrigin(candidate: string, entry: URL): boolean {
+    try {
+      return new URL(candidate).origin === entry.origin;
+    } catch {
+      return false;
+    }
   }
 
   /** Cheap fingerprint of what is on screen, to detect SPA route changes. */
@@ -592,6 +655,8 @@ export class SiteScout {
 
     const match = (pattern: RegExp): RouteCandidate | undefined =>
       candidates.find((c) => {
+        // "Sign in with Google" matches SIGNIN_TEXT but is a door out of the app.
+        if (OAUTH_TEXT.test(c.text)) return false;
         if (pattern.test(c.text)) return true;
         if (!c.href) return false;
         try {

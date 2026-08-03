@@ -46,8 +46,18 @@ export function makeDummyIdentity(seed: string): DummyIdentity {
   const firstName = pick(FIRST_NAMES, 0);
   const lastName = pick(LAST_NAMES, 1);
 
+  // `example.com` is RFC 2606 reserved, so nothing typed on camera can reach a
+  // real inbox. The catch, found by pointing this at a Supabase app: validators
+  // reject it outright — Supabase answers `email_address_invalid` — and Supabase
+  // auth is a large share of the apps anyone will demo. There is no domain that
+  // is both guaranteed unreachable and universally accepted, so the safe one is
+  // the default and an operator who needs signup to succeed names a domain they
+  // control. Never defaults to a domain we do not own: that would send mail to
+  // strangers.
+  const domain = process.env.PITCHBOX_DEMO_EMAIL_DOMAIN?.trim() || 'example.com';
+
   return {
-    email: `demo.user+${tag}@example.com`,
+    email: `demo.user+${tag}@${domain}`,
     // Long and mixed-class so it survives the usual signup validators without
     // the walkthrough having to read the error message and retry.
     password: `Demo-Pass-${tag}!7`,
