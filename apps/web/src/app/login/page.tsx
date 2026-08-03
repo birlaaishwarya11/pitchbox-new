@@ -46,24 +46,6 @@ function LoginForm() {
     }
   };
 
-  const handleGithub = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider: 'github',
-        options: {
-          redirectTo: `${window.location.origin}/auth/callback?redirect=${encodeURIComponent(redirect)}`,
-        },
-      });
-      if (error) throw error;
-      // Redirects away to GitHub; nothing else runs here on success.
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-      setBusy(false);
-    }
-  };
-
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-6">
       <div className="w-full max-w-sm space-y-6">
@@ -112,20 +94,6 @@ function LoginForm() {
             {busy ? 'Please wait…' : mode === 'signin' ? 'Sign in' : 'Sign up'}
           </button>
         </form>
-
-        <div className="flex items-center gap-3 text-xs text-zinc-600">
-          <div className="h-px flex-1 bg-zinc-800" />
-          or
-          <div className="h-px flex-1 bg-zinc-800" />
-        </div>
-
-        <button
-          onClick={handleGithub}
-          disabled={busy}
-          className="w-full rounded border border-zinc-700 py-2 text-sm hover:bg-zinc-900 disabled:opacity-50"
-        >
-          Continue with GitHub
-        </button>
 
         <p className="text-center text-sm text-zinc-400">
           {mode === 'signin' ? "Don't have an account? " : 'Already have an account? '}
