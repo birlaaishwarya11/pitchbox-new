@@ -118,11 +118,12 @@ export class SiteScout {
 
     let browser: Browser | undefined;
     let appError: string | undefined;
+    let authUsed: 'registered' | 'signed-in' | undefined;
     const finish = (): SiteMap => {
       if (screens.length >= this.maxScreens) {
         notes.push(`Exploration stopped at the ${this.maxScreens}-screen cap.`);
       }
-      return { origin: entry.origin, entryUrl: entry.toString(), screens, notes, appError };
+      return { origin: entry.origin, entryUrl: entry.toString(), screens, notes, appError, authUsed };
     };
 
     const run = async (): Promise<void> => {
@@ -192,7 +193,10 @@ export class SiteScout {
         triedSelectors.add(next.selector);
         // A button route's destination is unknowable until it is taken, so
         // the duplicate check has to happen here rather than when choosing it.
-        for (const screen of await this.visitRoute(page, next, entry, identity, deadline, notes)) {
+        const record = (how: 'registered' | 'signed-in') => {
+          authUsed = how;
+        };
+        for (const screen of await this.visitRoute(page, next, entry, identity, deadline, notes, record)) {
           if (visitedPaths.has(screen.path)) continue;
           if (screens.length >= this.maxScreens) break;
           screens.push(screen);
@@ -383,6 +387,7 @@ export class SiteScout {
     identity: DummyIdentity,
     deadline: number,
     notes: string[],
+    onAuth?: (how: 'registered' | 'signed-in') => void,
   ): Promise<ScreenSnapshot[]> {
     const from = new URL(page.url()).pathname;
     try {
@@ -416,14 +421,15 @@ export class SiteScout {
     // over authentication and reports why when it is refused.
     const isCredentialForm = form.fields.some((f) => f.kind === 'password');
     try {
-      await this.fillForm(page, form, identity);
       if (isCredentialForm) {
-        notes.push(
-          `Filled the credential form on ${screen.path} but did not submit it — a dummy persona has no ` +
-            'existing account, so signing in could only fail. Signup is attempted separately.',
-        );
-        return [screen];
+        // A credential form must be registered against, not signed into. Most
+        // apps put both on one screen behind a "Sign up" toggle rather than at a
+        // separate URL, which is why looking only at the landing page for a
+        // signup entry point found nothing and left the product locked.
+        const registered = await this.registerHere(page, entry, identity, notes, onAuth);
+        return registered.length ? [screen, ...registered] : [screen];
       }
+      await this.fillForm(page, form, identity);
       if (!(await this.submitForm(page, form))) return [screen];
       await this.settle(page, 2_000);
       const result = await this.harvest(
@@ -491,6 +497,173 @@ export class SiteScout {
     await this.settle(page);
   }
 
+/**
+   * Register on the screen we are already looking at.
+   *
+   * Signing in cannot work — the persona has no account — so the only way past a
+   * credential form is to create one. Apps overwhelmingly put sign-in and sign-up
+   * on the same screen behind a toggle, so the toggle is clicked first when there
+   * is one, and only then is the form filled and submitted.
+   */
+  private async registerHere(
+    page: Page,
+    entry: URL,
+    identity: DummyIdentity,
+    notes: string[],
+    onAuth?: (how: 'registered' | 'signed-in') => void,
+  ): Promise<ScreenSnapshot[]> {
+    const before = page.url();
+
+    // Switch the form into signup mode if the screen offers that.
+    try {
+      const candidates: RouteCandidate[] = [
+        ...(await page.evaluate(harvestNavButtons).catch(() => [])),
+        ...(await page.evaluate(harvestLinks).catch(() => [])),
+      ];
+      const toggle = candidates.find((c) => SIGNUP_TEXT.test(c.text) && !OAUTH_TEXT.test(c.text));
+      if (toggle) {
+        await page.click(toggle.selector, { delay: 20 }).catch(() => undefined);
+        await this.settle(page, 900);
+        if (!this.isSameOrigin(page.url(), entry)) {
+          await page.goto(before, { waitUntil: 'domcontentloaded', timeout: this.navigationTimeoutMs }).catch(() => undefined);
+          notes.push('The signup control led off-site, so registration was abandoned.');
+          return [];
+        }
+      } else {
+        notes.push('No signup toggle was found on the credential screen; trying the form as it stands.');
+      }
+    } catch {
+      /* the form as it stands is still worth a try */
+    }
+
+    // Re-harvest: switching mode usually adds or relabels fields.
+    const screen = await this.harvest(page, 'the signup form');
+    const form = pickFillableForm(screen.forms);
+    if (!form) {
+      notes.push('The signup screen had no fillable form.');
+      return [];
+    }
+
+    await this.fillForm(page, form, identity);
+    if (!(await this.submitForm(page, form))) {
+      notes.push('Filled the signup form but found no safe submit control.');
+      return [];
+    }
+    await this.settle(page, 3_000);
+
+    const landed = await this.harvest(page, `submitting the signup form with ${JSON.stringify(form.submitSelector ?? '')}`);
+
+    // Refused means "still on the same screen, still asking for credentials".
+    //
+    // The path comparison is load-bearing. Testing only for a lingering password
+    // field declared a *successful* signup a failure on the first app this was
+    // pointed at, because the page it landed on has an API-key input — which is
+    // `type="password"` like any other secret field. Signing in and being handed
+    // a form that wants a different secret are not the same thing.
+    const stillOnAuthScreen = landed.path === screen.path;
+    if (stillOnAuthScreen && pickFillableForm(landed.forms)?.fields.some((f) => f.kind === 'password')) {
+      const shown = await page
+        .evaluate(() => (document.body?.innerText ?? '').replace(/\s+/g, ' ').slice(0, 400))
+        .catch(() => '');
+      const emailRejected = /e-?mail[^.]{0,40}(invalid|not valid|not allowed|unsupported)/i.test(shown);
+      const needsConfirm = /(confirm|verify)[^.]{0,30}(e-?mail|inbox)|check your (e-?mail|inbox)/i.test(shown);
+      const alreadyExists = /already (registered|exists|in use|taken)|account already|user already/i.test(shown);
+
+      // The persona is deterministic so that a retry reuses the account it made
+      // rather than orphaning a new one. The flip side is that every run after
+      // the first is told the user already exists — at which point the obvious
+      // move is the one a person would make: sign in with the credentials we
+      // know, because we are the ones who created them.
+      if (alreadyExists) {
+        notes.push('This persona already has an account here, so signing in instead.');
+        const signedIn = await this.signInHere(page, entry, identity, notes);
+        if (signedIn) {
+          onAuth?.('signed-in');
+          return [signedIn];
+        }
+      }
+
+      notes.push(
+        'Signup was refused.' +
+          (emailRejected
+            ? ' The dummy email address was rejected — set PITCHBOX_DEMO_EMAIL_DOMAIN to a domain you control.'
+            : needsConfirm
+              ? ' The app requires email confirmation, so the walkthrough cannot get past the login.'
+              : alreadyExists
+                ? ' The persona already has an account and signing in did not work either.'
+                : ' It may require a captcha or an invite.') +
+          (shown ? ` It said: ${shown.slice(0, 160)}` : ''),
+      );
+      return [];
+    }
+
+    notes.push(`Registered and reached ${landed.path}.`);
+    onAuth?.('registered');
+    return [landed];
+  }
+
+/**
+   * Sign in on the current screen with the persona's own credentials.
+   *
+   * Only reached after an app reports the account already exists, which means
+   * this persona created it on an earlier run. This is the one case where
+   * submitting a credential form can succeed, so it is the one case where it is
+   * allowed to.
+   */
+  private async signInHere(
+    page: Page,
+    entry: URL,
+    identity: DummyIdentity,
+    notes: string[],
+  ): Promise<ScreenSnapshot | null> {
+    const before = new URL(page.url()).pathname;
+
+    // Flip back to sign-in mode if the screen is a toggle.
+    try {
+      const candidates: RouteCandidate[] = [
+        ...(await page.evaluate(harvestNavButtons).catch(() => [])),
+        ...(await page.evaluate(harvestLinks).catch(() => [])),
+      ];
+      const toggle = candidates.find((c) => SIGNIN_TEXT.test(c.text) && !OAUTH_TEXT.test(c.text));
+      if (toggle) {
+        await page.click(toggle.selector, { delay: 20 }).catch(() => undefined);
+        await this.settle(page, 900);
+        if (!this.isSameOrigin(page.url(), entry)) return null;
+      }
+    } catch {
+      /* the form as it stands may already be a sign-in */
+    }
+
+    const screen = await this.harvest(page, 'the sign-in form');
+    const form = pickFillableForm(screen.forms);
+    if (!form) return null;
+
+    await this.fillForm(page, form, identity);
+    if (!(await this.submitForm(page, form))) return null;
+    // Longer than a plain form post: this is a network round-trip to the auth
+    // provider followed by a client-side redirect.
+    await this.settle(page, 5_000);
+
+    const landed = await this.harvest(page, 'signing in with the persona that was registered earlier');
+    // Compare pathnames, not paths. `ScreenSnapshot.path` carries the query
+    // string, so measuring it against a bare pathname made
+    // `/login?redirect=%2Fpipeline` look like progress away from `/login` and
+    // reported a sign-in that had not happened.
+    const landedPath = (() => {
+      try {
+        return new URL(landed.url).pathname;
+      } catch {
+        return landed.path;
+      }
+    })();
+    if (landedPath === before) {
+      notes.push('Signing in did not move off the login screen either.');
+      return null;
+    }
+    notes.push(`Signed in and reached ${landedPath}.`);
+    return landed;
+  }
+
   /** True when `candidate` is on the origin the caller authorised. */
   private isSameOrigin(candidate: string, entry: URL): boolean {
     try {
@@ -546,7 +719,12 @@ export class SiteScout {
 
       const value = valueForField(field, identity);
       try {
-        await page.click(field.selector, { delay: 10 });
+        // Triple-click selects whatever is already in the field so that typing
+        // replaces it. `page.type` appends, and a form filled twice — which is
+        // exactly what happens when a signup is refused and the same screen is
+        // then used to sign in — ended up with the password entered twice over.
+        // The credentials were correct and the login still failed.
+        await page.click(field.selector, { clickCount: 3, delay: 10 });
         // Controlled React inputs ignore a value assignment, so type for real.
         await page.type(field.selector, value, { delay: 0 });
       } catch {

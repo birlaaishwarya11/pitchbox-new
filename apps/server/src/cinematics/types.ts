@@ -90,6 +90,16 @@ export interface SiteMap {
    * caller is told what the app said instead.
    */
   appError?: string;
+  /**
+   * How the scout got past the front door, when it did.
+   *
+   * This decides which persona the take may use. Scouting and recording use
+   * separate personas so that a signup performed on camera does not collide with
+   * the account scouting just made — but that only holds for a signup. If the
+   * scout *signed in*, only its own account exists, and a take using the other
+   * persona lands on "Invalid login credentials" in the finished video.
+   */
+  authUsed?: 'registered' | 'signed-in';
 }
 
 /**

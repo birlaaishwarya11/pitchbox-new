@@ -674,19 +674,30 @@ export class PipelineOrchestrator {
         for (const note of siteMap.notes) console.log(`[pipeline ${session.id}] scout: ${note}`);
       }
 
+      // If the scout signed in rather than registered, only its account exists —
+      // so the take has to be that persona. Recording with the other one puts
+      // "Invalid login credentials" in the finished video.
+      const takeIdentity =
+        siteMap.authUsed === 'signed-in' ? makeDummyIdentity(`${session.id}:scout`) : identity;
+      if (siteMap.authUsed) {
+        console.log(`[pipeline ${session.id}] scout ${siteMap.authUsed}; recording as the ${
+          takeIdentity === identity ? 'take' : 'scout'
+        } persona`);
+      }
+
       store.setStage(session.id, 'record', { status: 'running', message: 'planning the walkthrough…' });
       const walkthrough = await director.plan({
         script,
         durationSec: recordDurationMs / 1000,
         siteMap,
-        identity,
+        identity: takeIdentity,
       });
       const actions = walkthrough.beats.filter((b) => b.action !== 'hold' && b.action !== 'scrollTo').length;
       console.log(
         `[pipeline ${session.id}] directed ${walkthrough.beats.length} beats (${actions} interactions)`,
       );
 
-      return { beats: walkthrough.beats, identity };
+      return { beats: walkthrough.beats, identity: takeIdentity };
     } catch (err) {
       console.warn(
         `[pipeline ${session.id}] walkthrough planning failed, the recording will scroll instead:`,
