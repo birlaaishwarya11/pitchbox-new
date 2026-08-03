@@ -143,7 +143,7 @@ export function loginViewerHtml(sessionId: string, token: string): string {
   </div>
   <div id="screen"></div>
 <script type="module">
-  import RFB from '/novnc/core/rfb.js';
+  import RFB from '/api/novnc/core/rfb.js';
 
   const status = document.getElementById('status');
   const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + ${JSON.stringify(socketPath)};

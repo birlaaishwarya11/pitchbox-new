@@ -2,6 +2,7 @@
 import './loadEnv';
 import path from 'node:path';
 import http from 'node:http';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import express, { type Express, type Request, type Response } from 'express';
 import cors from 'cors';
@@ -987,14 +988,35 @@ function redactSession(session: ReturnType<SessionStore['get']>) {
 
 // noVNC's client, served straight from the installed package: one page does not
 // justify a bundler step.
-app.use(
-  '/novnc',
-  express.static(path.join(process.cwd(), '..', '..', 'node_modules', '@novnc', 'novnc'), {
-    // Immutable versioned assets; long cache is safe and keeps the viewer snappy.
-    maxAge: '1h',
-    index: false,
-  }),
-);
+//
+// Mounted under /api because that is the prefix the web front end proxies to this
+// server. Served at /novnc it 404'd in production — the request never left the
+// Next.js app — while working locally where the two run on separate ports.
+//
+// The directory is resolved from the package itself rather than built out of
+// `process.cwd()`. A relative hop guessed at the repo layout: correct from
+// apps/server locally, and wrong in the container, where the working directory is
+// the workspace root and the same hop landed on /node_modules.
+const novncDir = (() => {
+  try {
+    const require_ = createRequire(import.meta.url);
+    return path.dirname(require_.resolve('@novnc/novnc/package.json'));
+  } catch {
+    return undefined;
+  }
+})();
+if (novncDir) {
+  app.use(
+    '/api/novnc',
+    express.static(novncDir, {
+      // Immutable versioned assets; a long cache keeps the viewer snappy.
+      maxAge: '1h',
+      index: false,
+    }),
+  );
+} else {
+  console.warn('[server] @novnc/novnc is not installed; the interactive login viewer will not load.');
+}
 
 const httpServer = http.createServer(app);
 
