@@ -349,7 +349,10 @@ export default function PipelinePage() {
         const r = await authFetch(`${SERVER_BASE}/api/pipeline/${session.id}/login/start`, { method: 'POST' });
         const data = await r.json();
         if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
-        if (!cancelled) setLoginViewer(`${SERVER_BASE}${data.viewerUrl}`);
+        // The server may return an absolute URL, because the viewer's websocket
+        // cannot go through the /api proxy and must reach the API origin directly.
+        const viewer: string = data.viewerUrl ?? '';
+        if (!cancelled) setLoginViewer(/^https?:\/\//.test(viewer) ? viewer : `${SERVER_BASE}${viewer}`);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       } finally {

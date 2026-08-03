@@ -924,12 +924,19 @@ app.post('/api/pipeline/:id/login/start', auth, async (req: Request, res: Respon
 
   try {
     const view = await interactiveLogin.start(req.params.id, session.input.recordUrl);
+    // Absolute, and pointing at this server directly.
+    //
+    // The web front end proxies /api here, but that proxy does not carry
+    // websocket upgrades — they come back as 404 from the front end and never
+    // reach this process. The viewer is a VNC session over a websocket, so it has
+    // to be loaded from an origin that can carry one. PITCHBOX_PUBLIC_ORIGIN is
+    // that origin; without it the URL stays relative, which is correct for a
+    // deployment where the API is reached directly.
+    const publicOrigin = process.env.PITCHBOX_PUBLIC_ORIGIN?.trim().replace(/\/$/, '') ?? '';
+    const viewerPath = `/api/pipeline/${encodeURIComponent(req.params.id)}/login/viewer?token=${encodeURIComponent(view.token)}`;
     // The token is returned once, to the authenticated owner. It is what guards
     // the viewer and its socket — there is a live browser behind them.
-    res.json({
-      viewerUrl: `/api/pipeline/${encodeURIComponent(req.params.id)}/login/viewer?token=${encodeURIComponent(view.token)}`,
-      expiresAt: view.expiresAt,
-    });
+    res.json({ viewerUrl: `${publicOrigin}${viewerPath}`, expiresAt: view.expiresAt });
   } catch (error) {
     res.status(500).json({ error: error instanceof Error ? error.message : String(error) });
   }

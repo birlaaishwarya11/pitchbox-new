@@ -50,7 +50,15 @@ export function attachLoginSocket(server: HttpServer, deps: LoginViewerDeps): We
     }
 
     const match = LOGIN_SOCKET_PATH_RE.exec(url.pathname);
-    if (!match) return; // not ours; leave it for anything else listening
+    if (!match) {
+      // Close it rather than returning. Nothing else on this server handles
+      // upgrades, so a bare `return` left the socket open with no response and
+      // the client sat there until it timed out — which looks identical to the
+      // server being unreachable.
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
 
     const sessionId = decodeURIComponent(match[1]);
     const login = deps.manager.authorise(sessionId, url.searchParams.get('token') ?? undefined);
