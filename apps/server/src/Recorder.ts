@@ -1,9 +1,17 @@
 /// <reference lib="dom" />
 import { randomUUID } from 'node:crypto';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { harvestTargets, installCinematics, applyShot, resetCamera } from './cinematics/pageScript';
-import type { PageTarget, Shot } from './cinematics/types';
-import { mkdtemp, mkdir, rename, rm } from 'node:fs/promises';
+import {
+  dismissOverlays,
+  installCinematics,
+  moveCamera,
+  resetCamera,
+  moveCursorTo,
+  cursorPulse,
+} from './cinematics/pageScript';
+import type { Beat } from './cinematics/types';
+import { resolveTokens, type DummyIdentity } from './cinematics/dummyIdentity';
+import { mkdtemp, mkdir, rename, rm, access, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -86,7 +94,6 @@ export interface RecordingStorageProvider {
 }
 
 type VirtualDisplaySession = {
-  instance: Xvfb;
   display: string;
   stop: () => Promise<void>;
 };
@@ -117,6 +124,157 @@ const DEFAULT_FFMPEG: FfmpegOptions = {
 };
 
 const DEFAULT_RECORDINGS_DIR = path.resolve(process.cwd(), 'recordings');
+
+/**
+ * How long a camera move takes. Also its lead time: the move is started this
+ * far before the beat is due, so it *settles* on the beat instead of beginning
+ * on it — a push-in that is still travelling when the narrator names the thing
+ * reads as a late reaction.
+ */
+const CAMERA_MOVE_MS = 1_100;
+/** Matches the pointer's CSS transition, so a click waits for it to arrive. */
+const CURSOR_GLIDE_MS = 520;
+/** Per-character typing delay. Fast enough to not drag, slow enough to read. */
+const TYPE_DELAY_MS = 55;
+/** Breathing room after a click for the app to actually respond. */
+const POST_CLICK_MS = 700;
+/**
+ * How long the capture may go without a single good frame before it gives up.
+ *
+ * Measured in time rather than attempts: a navigation mid-walkthrough makes
+ * frames fail for as long as the document swap takes, and counting attempts
+ * turned a slow page into a truncated recording.
+ */
+const FRAME_FAILURE_WINDOW_MS = 25_000;
+/**
+ * Ceiling on a single frame. `page.screenshot()` takes no timeout of its own in
+ * this Puppeteer version, and it can block indefinitely while the renderer
+ * swaps documents — which is precisely when the walkthrough is navigating.
+ */
+const SCREENSHOT_TIMEOUT_MS = 15_000;
+/** How long an input event will wait for an in-flight screenshot to finish. */
+const INPUT_SETTLE_MS = 400;
+/**
+ * Deadline for the very first frame, which doubles as a probe.
+ *
+ * Short on purpose: if compositor capture is going to hang, this is how quickly
+ * we find out and switch strategy, rather than burning the full deadline.
+ */
+const FIRST_FRAME_TIMEOUT_MS = 5_000;
+
+/** See `instrumentPage` for why this exists and why it is a string. */
+const SHIM_SOURCE = 'globalThis.__name = globalThis.__name || ((fn) => fn)';
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** An ffmpeg child whose stderr tail has been retained for diagnosis. */
+type FfmpegProcess = ChildProcessWithoutNullStreams & { pbxStderr?: string };
+
+/** Turn an ffmpeg exit code into something a human can act on. */
+function describeFfmpegFailure(proc: ChildProcessWithoutNullStreams, code: number | null): string {
+  const stderr = (proc as FfmpegProcess).pbxStderr?.trim();
+  const signal = proc.signalCode;
+  const parts = [`ffmpeg exited with code ${code ?? signal ?? 'unknown'}.`];
+
+  if (signal === 'SIGKILL' || code === 137) {
+    parts.push('It was killed — on a small container this is almost always the out-of-memory killer.');
+  }
+  if (stderr) {
+    parts.push(`ffmpeg said:\n${stderr.split(/\r?\n/).slice(-12).join('\n')}`);
+  } else {
+    parts.push('ffmpeg produced no diagnostic output.');
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Reject if `promise` has not settled within `ms`.
+ *
+ * The abandoned promise keeps a rejection handler attached: dropping a screen-
+ * shot that later fails would otherwise take the process down with an unhandled
+ * rejection.
+ */
+function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} exceeded ${ms}ms`)), ms);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/**
+ * Keeps mouse input and screen capture off each other's toes.
+ *
+ * A `page.screenshot()` in flight while a mouse press/release pair is being
+ * dispatched eats the click: the command resolves, the pointer visibly lands on
+ * the button, and nothing happens. That silently froze the walkthrough on the
+ * landing page — every navigation dropped, with no error to notice.
+ *
+ * The obvious fix, one mutex over both, is worse than the bug. A screenshot
+ * taken during a document swap can block indefinitely, and a shared queue turns
+ * that into a deadlock: the click waits behind the hung frame, the next frame
+ * waits behind the click, and the recording holds one image until the watchdog
+ * kills the browser. So input never queues. It signals intent — which stops new
+ * frames being started — waits a bounded moment for anything already running,
+ * and then goes regardless.
+ *
+ * Keyboard input stays outside entirely: typing holds the channel for a second
+ * or more, and the whole point of typing on camera is watching it arrive.
+ */
+class CaptureGate {
+  private inFlight: Promise<unknown> | null = null;
+  private pendingInput = 0;
+
+  /** True while input is being dispatched; the capture loop should stand off. */
+  get inputActive(): boolean {
+    return this.pendingInput > 0;
+  }
+
+  /** Capture side. Records the in-flight frame so input can wait on it. */
+  async capture<T>(fn: () => Promise<T>): Promise<T> {
+    const task = fn();
+    this.inFlight = task;
+    try {
+      return await task;
+    } finally {
+      if (this.inFlight === task) this.inFlight = null;
+    }
+  }
+
+  /** Input side. Yields to a running frame, but never waits on a stuck one. */
+  async input<T>(fn: () => Promise<T>): Promise<T> {
+    this.pendingInput += 1;
+    try {
+      const running = this.inFlight;
+      if (running) {
+        await Promise.race([
+          running.then(
+            () => undefined,
+            () => undefined,
+          ),
+          new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, INPUT_SETTLE_MS);
+            timer.unref?.();
+          }),
+        ]);
+      }
+      return await fn();
+    } finally {
+      this.pendingInput -= 1;
+    }
+  }
+}
 
 const envForceXvfb = (() => {
   if (process.env.RECORDER_ENABLE_XVFB) {
@@ -230,11 +388,14 @@ export class Recorder {
     options: {
       targetDurationMs?: number;
       /**
-       * Given the elements found on the page, return the camera moves to make.
-       * Optional: without it the recorder falls back to a plain scroll, which is
-       * what happens when no LLM is available or shot planning fails.
+       * The walkthrough to perform: navigations, clicks, typing and the camera
+       * framing for each. Optional — without it the recorder falls back to a
+       * plain scroll, which is what happens when no LLM is available or when
+       * scouting or directing failed.
        */
-      planShots?: (targets: PageTarget[]) => Promise<Shot[]>;
+      beats?: Beat[];
+      /** Persona substituted into `{{token}}` values as they are typed. */
+      identity?: DummyIdentity;
     } = {},
   ): Promise<RecordingResult> {
     const url = this.normalizeUrl(rawUrl);
@@ -246,9 +407,15 @@ export class Recorder {
 
     try {
       if (mode === 'xvfb') {
-        await this.recordWithXvfb(url, tmpOutput);
+        await this.recordWithXvfb(url, tmpOutput, options.targetDurationMs, options.beats, options.identity);
       } else {
-        await this.recordWithScreenshots(url, tmpOutput, options.targetDurationMs, options.planShots);
+        await this.recordWithScreenshots(
+          url,
+          tmpOutput,
+          options.targetDurationMs,
+          options.beats,
+          options.identity,
+        );
       }
 
       const endedAt = new Date();
@@ -278,7 +445,29 @@ export class Recorder {
     }
   }
 
-  private async recordWithXvfb(url: string, tmpOutput: string): Promise<void> {
+  /**
+   * Capture by grabbing an X display, and drive the walkthrough on it.
+   *
+   * This path exists because asking Chromium for frames does not work
+   * everywhere. Inside the Daytona sandbox both `page.screenshot` strategies
+   * hang indefinitely — compositor and renderer alike — while the same browser
+   * navigates and runs scripts perfectly. ffmpeg reading the X display never
+   * asks the browser for anything, so it is immune to whatever that is.
+   *
+   * It used to only scroll, which is why the repo path could not have produced a
+   * walkthrough even once the app was running. It now runs the same beats as the
+   * screenshot path.
+   *
+   * It also needs no capture gate: with no screenshots in flight there is nothing
+   * for a mouse event to collide with, which removes that hazard entirely.
+   */
+  private async recordWithXvfb(
+    url: string,
+    tmpOutput: string,
+    targetDurationMs?: number,
+    beats?: Beat[],
+    identity?: DummyIdentity,
+  ): Promise<void> {
     let virtualDisplay: VirtualDisplaySession | undefined;
     let ffmpegProcess: ChildProcessWithoutNullStreams | undefined;
     let browser: Browser | undefined;
@@ -293,8 +482,27 @@ export class Recorder {
       browser = await this.launchBrowserHeaded(ffmpegDisplay);
       const page = await browser.newPage();
       await this.preparePage(page, url);
-      await this.scrollToBottom(page);
-      await this.delay(this.scroll.tailWaitMs);
+
+      const walkthrough = beats ?? [];
+      const startedAt = Date.now();
+
+      if (walkthrough.length) {
+        try {
+          await this.instrumentPage(page);
+          // A gate with no screenshot side is a no-op, which is exactly right.
+          await this.runWalkthrough(page, walkthrough, targetDurationMs ?? 0, new CaptureGate(), identity);
+        } catch (err) {
+          console.warn('[recorder] walkthrough aborted:', describeError(err));
+        }
+      } else {
+        await this.scrollToBottom(page).catch(() => undefined);
+      }
+
+      // ffmpeg is recording wall-clock time, so hold the display until the
+      // narration's full length has elapsed rather than stopping when the
+      // walkthrough happens to finish.
+      const remaining = (targetDurationMs ?? 0) - (Date.now() - startedAt);
+      await this.delay(remaining > 0 ? remaining : this.scroll.tailWaitMs);
 
       await this.stopProcess(ffmpegProcess);
       ffmpegProcess = undefined;
@@ -304,6 +512,18 @@ export class Recorder {
 
       await virtualDisplay.stop();
       virtualDisplay = undefined;
+
+      // The exit code cannot say whether this worked (see stopProcess), so the
+      // file does.
+      const written = await stat(tmpOutput).catch(() => undefined);
+      if (!written || written.size < 1_024) {
+        throw new RecorderError(
+          'FFMPEG_FAILED',
+          `X11 capture produced ${written ? `${written.size} bytes` : 'no file'} — nothing was recorded. ` +
+            'ffmpeg may not have been able to read the virtual display.',
+        );
+      }
+      console.log(`[recorder] X11 capture wrote ${(written.size / 1024).toFixed(0)} KB`);
     } finally {
       if (ffmpegProcess) {
         ffmpegProcess.kill('SIGKILL');
@@ -321,12 +541,14 @@ export class Recorder {
     url: string,
     tmpOutput: string,
     targetDurationMs?: number,
-    planShots?: (targets: PageTarget[]) => Promise<Shot[]>,
+    beats?: Beat[],
+    identity?: DummyIdentity,
   ): Promise<void> {
     let ffmpegProcess: ChildProcessWithoutNullStreams | undefined;
     let browser: Browser | undefined;
     let capturing = false;
     let watchdog: NodeJS.Timeout | undefined;
+    const gate = new CaptureGate();
     // Measured so the finished file can be retimed to real time — see below.
     let capturedMs = 0;
     let capturedFrames = 0;
@@ -346,31 +568,19 @@ export class Recorder {
       await page.setViewport({ width: this.viewport.width, height: this.viewport.height });
       await this.preparePage(page, url);
 
-      // Plan the camera before any frame is captured, so shot 0 is already in
-      // place when recording starts. Failure here is not fatal: a plain scroll
-      // is a worse video, not a broken one.
-      let shots: Shot[] = [];
-      if (planShots) {
+      // Install the camera before any frame is captured, so beat 0 is already
+      // in place when recording starts. Failure here is not fatal: a plain
+      // scroll is a worse video, not a broken one.
+      let walkthrough = beats ?? [];
+      if (walkthrough.length) {
         try {
-          // tsx/esbuild wraps transpiled functions with a `__name` helper to
-          // preserve Function.prototype.name. page.evaluate() ships the
-          // function's *source* to the browser, where that helper doesn't
-          // exist — so every camera call died with "__name is not defined" and
-          // silently fell back to scrolling. Define a no-op shim first.
-          // Passed as a string on purpose: string arguments aren't transpiled,
-          // so this one line can't itself depend on the helper it installs.
-          await page.evaluate('globalThis.__name = globalThis.__name || ((fn) => fn)');
-
-          const targets = await page.evaluate(harvestTargets);
-          if (targets.length) {
-            shots = await planShots(targets);
-            await page.evaluate(installCinematics);
-          }
+          await this.instrumentPage(page);
         } catch (err) {
-          console.warn('[recorder] shot planning failed, falling back to scroll:', err);
-          shots = [];
+          console.warn('[recorder] could not install the camera, falling back to scroll:', err);
+          walkthrough = [];
         }
       }
+      const hasWalkthrough = walkthrough.length > 0;
 
       capturing = true;
       const frameIntervalMs = Math.max(1, Math.floor(1000 / this.ffmpeg.frameRate));
@@ -393,11 +603,11 @@ export class Recorder {
       }, hardCapMs);
       watchdog.unref?.();
 
-      // Either the camera runs the shot list, or we fall back to scrolling.
+      // Either the walkthrough drives the app, or we fall back to scrolling.
       // Both are fire-and-forget: they drive motion while frames are captured.
-      const scrollPromise = shots.length
-        ? this.runShotList(page, shots, targetDurationMs ?? 0).catch((err) => {
-            console.warn('[recorder] shot list aborted:', err);
+      const scrollPromise = hasWalkthrough
+        ? this.runWalkthrough(page, walkthrough, targetDurationMs ?? 0, gate, identity).catch((err) => {
+            console.warn('[recorder] walkthrough aborted:', err);
           })
         : this.scrollToBottom(page).catch(() => undefined);
 
@@ -410,18 +620,69 @@ export class Recorder {
         scrollFinished = true;
       });
 
+      let healthyAt = Date.now();
+      let frameErrors = 0;
+      // Compositor capture is ~13x faster where it works — 24ms a frame locally
+      // against 313ms — so it stays the default and is abandoned only if it
+      // actually fails. Inside the Daytona sandbox it hangs indefinitely: there
+      // is no compositor surface to read back from, and every frame ran out its
+      // deadline while the same Chromium navigated and ran scripts perfectly.
+      // Pinning either value would give up the fast path or the sandbox, so the
+      // first failed frame flips it and the rest of the capture proceeds.
+      let fromSurface = true;
       while (capturing) {
         const frameStart = Date.now();
+
+        // Stand off while a click is being dispatched, so the input lands on a
+        // channel of its own. Cheap: input holds this for a few tens of ms.
+        if (gate.inputActive) {
+          await this.delay(15);
+          continue;
+        }
+
         let frame: Buffer;
         try {
-          frame = (await page.screenshot({
-            type: 'jpeg',
-            quality: 80,
-            fullPage: false,
-            captureBeyondViewport: false,
-          })) as Buffer;
-        } catch {
-          break;
+          frame = (await gate.capture(() =>
+            withDeadline(
+              page.screenshot({
+                type: 'jpeg',
+                quality: 80,
+                fullPage: false,
+                captureBeyondViewport: false,
+                fromSurface,
+                // Skips Puppeteer's extra encode pass. On a constrained sandbox
+                // that pass is the difference between a frame arriving and the
+                // whole capture timing out.
+                optimizeForSpeed: true,
+              }),
+              frameCount === 0 ? FIRST_FRAME_TIMEOUT_MS : SCREENSHOT_TIMEOUT_MS,
+              'screenshot',
+            ),
+          )) as Buffer;
+          healthyAt = Date.now();
+        } catch (err) {
+          // The walkthrough navigates mid-capture, and a screenshot straddling
+          // a document swap fails or stalls. Dropping the recording there would
+          // truncate it at the first page change, so ride the failures out and
+          // give up only if nothing has come back for a good while.
+          //
+          // Logged, and sparsely: a sandbox that cannot screenshot at all
+          // produces an empty video, and without this the only evidence was a
+          // bare ffmpeg exit code with no mention of the real cause.
+          frameErrors += 1;
+          if (frameErrors <= 3 || frameErrors % 50 === 0) {
+            console.warn(`[recorder] screenshot ${frameErrors} failed: ${describeError(err)}`);
+          }
+          // Nothing has been captured yet and the fast path just failed: this is
+          // a machine with no readable surface, so stop asking for one.
+          if (frameCount === 0 && fromSurface) {
+            fromSurface = false;
+            console.warn('[recorder] compositor capture is not working here; falling back to renderer capture.');
+            continue;
+          }
+          if (Date.now() - healthyAt >= FRAME_FAILURE_WINDOW_MS) break;
+          await this.delay(frameIntervalMs);
+          continue;
         }
 
         if (!ffmpegStdin.writable) break;
@@ -435,7 +696,9 @@ export class Recorder {
           if (Date.now() >= endAt) break;
           // Time left but nothing moving: restart the scroll so the footage keeps
           // motion instead of holding one frozen frame under the narration.
-          if (scrollFinished) {
+          // Never do this under a walkthrough — a scroll started behind the
+          // camera's back drags the page out from under the framing.
+          if (scrollFinished && !hasWalkthrough) {
             scrollFinished = false;
             void page
               .evaluate(() => window.scrollTo({ top: 0, behavior: 'auto' }))
@@ -459,6 +722,18 @@ export class Recorder {
       capturedMs = Date.now() - captureStartedAt;
       capturedFrames = frameCount;
       ffmpegStdin.end();
+
+      // Diagnose this here rather than letting ffmpeg fail on an empty stream:
+      // "ffmpeg exited with code 234" tells nobody that not one screenshot ever
+      // came back, which is the actual problem.
+      if (frameCount === 0) {
+        throw new RecorderError(
+          'UNEXPECTED_FAILURE',
+          `No frames were captured — all ${frameErrors} screenshot attempt(s) failed, so there was ` +
+            'nothing to encode. The browser may have died, or the machine may be too slow or too ' +
+            `small to screenshot the page within ${SCREENSHOT_TIMEOUT_MS}ms.`,
+        );
+      }
 
       // The watchdog may have already closed the browser; close() is safe to
       // call again but can reject, so swallow it.
@@ -553,6 +828,15 @@ export class Recorder {
     }
   }
 
+  /**
+   * Start a virtual X display for ffmpeg to grab.
+   *
+   * Xvfb is spawned directly rather than through the `xvfb` npm wrapper. The
+   * wrapper's job is to allocate a display and tell you its number, and inside
+   * the Daytona sandbox it does the first but not the second — the run died with
+   * "Xvfb did not provide a display number" while Xvfb itself was fine. Choosing
+   * the number here removes the guesswork: we know what we asked for.
+   */
   private async startVirtualDisplay(): Promise<VirtualDisplaySession> {
     if (!this.xvfbOptions.enabled) {
       throw new RecorderError(
@@ -562,59 +846,62 @@ export class Recorder {
     }
 
     const screen = `${this.viewport.width}x${this.viewport.height}x${this.xvfbOptions.depth}`;
-    const xvfb = new Xvfb({
-      xvfb_args: ['-screen', '0', screen, '-nolisten', 'tcp', ...this.xvfbOptions.extraArgs],
-    });
 
-    await new Promise<void>((resolve, reject) => {
-      xvfb.start((err?: Error | null) => {
-        if (err) {
-          reject(new RecorderError('XVFB_START_FAILED', 'Failed to start Xvfb.', { cause: err }));
-          return;
+    // Try a few display numbers: a sandbox may already have one in use, and
+    // Xvfb fails rather than picking another.
+    let lastError: unknown;
+    for (const candidate of [99, 98, 97, 96]) {
+      const display = `:${candidate}`;
+      const child = spawn(
+        'Xvfb',
+        [display, '-screen', '0', screen, '-nolisten', 'tcp', ...this.xvfbOptions.extraArgs],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+
+      let stderr = '';
+      child.stderr?.on('data', (chunk: Buffer) => {
+        stderr = `${stderr}${chunk.toString()}`.slice(-2_000);
+      });
+
+      const exited = new Promise<number | null>((resolve) => {
+        child.once('exit', (code) => resolve(code));
+        child.once('error', () => resolve(-1));
+      });
+
+      // Ready when the lock file appears; Xvfb creates it once it is serving.
+      const ready = (async () => {
+        for (let attempt = 0; attempt < 40; attempt++) {
+          try {
+            await access(`/tmp/.X${candidate}-lock`);
+            return true;
+          } catch {
+            await this.delay(250);
+          }
         }
-        resolve();
-      });
-    });
+        return false;
+      })();
 
-    const displayNumber = this.extractDisplayNumber(xvfb);
+      const outcome = await Promise.race([ready, exited.then(() => false as const)]);
 
-    if (displayNumber === undefined) {
-      await new Promise<void>((resolve) => {
-        xvfb.stop(() => resolve());
-      });
-      throw new RecorderError('XVFB_DISPLAY_UNAVAILABLE', 'Xvfb did not provide a display number.');
+      if (outcome === true) {
+        return {
+          display,
+          stop: async () => {
+            child.kill('SIGTERM');
+            await this.delay(200);
+            if (child.exitCode === null) child.kill('SIGKILL');
+          },
+        };
+      }
+
+      child.kill('SIGKILL');
+      lastError = stderr.trim() || `Xvfb on ${display} did not become ready`;
     }
 
-    const display = `:${displayNumber}`;
-
-    return {
-      instance: xvfb,
-      display,
-      stop: () =>
-        new Promise<void>((resolve, reject) => {
-          xvfb.stop((err?: Error | null) => {
-            if (err) {
-              reject(new RecorderError('XVFB_START_FAILED', 'Failed to stop Xvfb.', { cause: err }));
-              return;
-            }
-            resolve();
-          });
-        }),
-    };
-  }
-
-  private extractDisplayNumber(xvfb: Xvfb): number | undefined {
-    const candidate = (xvfb as { display?: number }).display;
-    if (typeof candidate === 'number') {
-      return candidate;
-    }
-
-    const hiddenCandidate = (xvfb as { _display?: number })._display;
-    if (typeof hiddenCandidate === 'number') {
-      return hiddenCandidate;
-    }
-
-    return undefined;
+    throw new RecorderError(
+      'XVFB_START_FAILED',
+      `Could not start Xvfb on any display. Last error: ${String(lastError)}`,
+    );
   }
 
   private spawnFfmpegX11(display: string, outputPath: string): ChildProcessWithoutNullStreams {
@@ -642,9 +929,11 @@ export class Recorder {
       outputPath,
     ];
 
-    return spawn('ffmpeg', ffmpegArgs, {
-      env: { ...process.env, DISPLAY: display },
-    });
+    return this.traceFfmpeg(
+      spawn('ffmpeg', ffmpegArgs, {
+        env: { ...process.env, DISPLAY: display },
+      }),
+    );
   }
 
   private spawnFfmpegImagePipe(outputPath: string): ChildProcessWithoutNullStreams {
@@ -674,7 +963,24 @@ export class Recorder {
       outputPath,
     ];
 
-    return spawn('ffmpeg', ffmpegArgs);
+    return this.traceFfmpeg(spawn('ffmpeg', ffmpegArgs));
+  }
+
+  /**
+   * Keep the tail of ffmpeg's stderr on the process object.
+   *
+   * ffmpeg explains itself on stderr and then exits with a code that means
+   * nothing on its own. A real sandbox run died with "ffmpeg exited with code
+   * 234" and there was no way to find out why, because the only thing anyone
+   * ever saw was the number.
+   */
+  private traceFfmpeg(proc: ChildProcessWithoutNullStreams): ChildProcessWithoutNullStreams {
+    const traced = proc as FfmpegProcess;
+    traced.pbxStderr = '';
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      traced.pbxStderr = `${traced.pbxStderr ?? ''}${chunk.toString()}`.slice(-4_000);
+    });
+    return proc;
   }
 
   private async waitForProcessSpawn(
@@ -696,26 +1002,37 @@ export class Recorder {
     });
   }
 
+  /**
+   * Stop a recording ffmpeg that we started, and do not mistake its goodbye for
+   * a failure.
+   *
+   * ffmpeg exits 255 when it is interrupted — which is precisely how this stops
+   * it — and it finalises the file on the way out. Insisting on exit 0 therefore
+   * failed every X11 capture *after* it had successfully recorded, reported as a
+   * bare "ffmpeg exited with code 255". A non-zero code here is expected; the
+   * output file is what says whether the capture worked, and the caller checks
+   * that next.
+   */
   private async stopProcess(process: ChildProcessWithoutNullStreams): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
+    await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
         process.kill('SIGKILL');
-      }, 5_000);
+        resolve();
+      }, 8_000);
 
       process.once('close', (code) => {
         clearTimeout(timeout);
-        if (code === 0) {
-          resolve();
-        } else {
-          reject(
-            new RecorderError('FFMPEG_FAILED', `ffmpeg exited with code ${code ?? 'unknown'}.`),
-          );
+        // 255 and 130 are the two ways ffmpeg reports "you interrupted me".
+        if (code !== null && code !== 0 && code !== 255 && code !== 130) {
+          console.warn(`[recorder] ${describeFfmpegFailure(process, code)}`);
         }
+        resolve();
       });
 
       process.once('error', (error) => {
         clearTimeout(timeout);
-        reject(new RecorderError('FFMPEG_FAILED', 'ffmpeg encountered an error.', { cause: error }));
+        console.warn('[recorder] ffmpeg errored while stopping:', describeError(error));
+        resolve();
       });
 
       process.kill('SIGINT');
@@ -728,7 +1045,7 @@ export class Recorder {
     // on the recorded exit state instead.
     if (process.exitCode !== null || process.signalCode !== null) {
       if (process.exitCode === 0) return;
-      throw new RecorderError('FFMPEG_FAILED', `ffmpeg exited with code ${process.exitCode ?? process.signalCode}.`);
+      throw new RecorderError('FFMPEG_FAILED', describeFfmpegFailure(process, process.exitCode));
     }
 
     await new Promise<void>((resolve, reject) => {
@@ -744,9 +1061,7 @@ export class Recorder {
         if (code === 0) {
           resolve();
         } else {
-          reject(
-            new RecorderError('FFMPEG_FAILED', `ffmpeg exited with code ${code ?? 'unknown'}.`),
-          );
+          reject(new RecorderError('FFMPEG_FAILED', describeFfmpegFailure(process, code)));
         }
       });
 
@@ -763,12 +1078,25 @@ export class Recorder {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--autoplay-policy=no-user-gesture-required',
+      // This browser is being filmed, so none of the browser may be in shot.
+      // Grabbing an X display captures the whole window, chrome included, and
+      // the first successful sandbox recording came out with a tab strip, a URL
+      // bar and a yellow "Chrome is being controlled by automated test software"
+      // banner across the top — a technically correct video nobody could publish.
+      '--kiosk',
+      '--start-fullscreen',
+      '--disable-infobars',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--window-position=0,0',
       `--window-size=${this.viewport.width},${this.viewport.height}`,
     ]);
 
     const launchOptions: LaunchOptions & BrowserLaunchArgumentOptions = {
       // Chromium renders to the Xvfb virtual display, so it cannot be in headless mode here.
       headless: false,
+      // Puppeteer adds `--enable-automation`, which is what draws the banner.
+      ignoreDefaultArgs: ['--enable-automation'],
       defaultViewport: {
         width: this.viewport.width,
         height: this.viewport.height,
@@ -788,6 +1116,15 @@ export class Recorder {
       '--disable-dev-shm-usage',
       '--autoplay-policy=no-user-gesture-required',
       '--hide-scrollbars',
+      // Container-safe rendering. Inside the Daytona sandbox every screenshot
+      // was timing out after 15 seconds and the capture produced no frames at
+      // all — which is what surfaced originally as an unexplained `ffmpeg exited
+      // with code 234`. A headless Chromium with no GPU and no compositor to
+      // read a surface from is the usual cause, and these are the usual flags.
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--in-process-gpu',
+      '--use-gl=swiftshader',
       `--window-size=${this.viewport.width},${this.viewport.height}`,
     ]);
 
@@ -805,6 +1142,9 @@ export class Recorder {
   }
 
   private async preparePage(page: Page, url: string): Promise<void> {
+    // Registered before the first navigation so the shim is present on every
+    // document the walkthrough reaches, including this one.
+    await page.evaluateOnNewDocument(SHIM_SOURCE).catch(() => undefined);
     try {
       // Wait only for DOM content — SPAs with persistent connections (websockets,
       // analytics, realtime) may never reach full network idle, which would hang
@@ -818,32 +1158,144 @@ export class Recorder {
       throw new RecorderError('NAVIGATION_FAILED', `Unable to navigate to ${url}`, { cause: error });
     }
     await page.waitForNetworkIdle({ idleTime: 500, timeout: 8_000 }).catch(() => undefined);
+    // Done here as well as per-beat: a plain scrolling capture never calls
+    // instrumentPage, and a cookie wall ruins that recording just as thoroughly.
+    await page.evaluate(SHIM_SOURCE).catch(() => undefined);
+    const dismissed = await page.evaluate(dismissOverlays).catch(() => null);
+    if (dismissed) {
+      console.log(`[recorder] dismissed an overlay via "${dismissed}"`);
+      await this.delay(600);
+    }
     await this.delay(this.scroll.preScrollWaitMs);
   }
 
   /**
-   * Execute planned shots against the wall clock.
+   * Drive the app through the planned walkthrough, against the wall clock.
    *
-   * Timing is absolute rather than cumulative: a slow `applyShot` would
-   * otherwise push every later shot out of sync with the narration, and the
-   * whole point is that the picture lands on the sentence.
+   * Timing is absolute rather than cumulative: a slow camera move or a page
+   * that takes its time would otherwise push every later beat out of sync with
+   * the narration, and the whole point is that the picture lands on the
+   * sentence. Camera moves additionally *lead* their beat by the length of the
+   * move, so they settle on it rather than starting on it.
    */
-  private async runShotList(page: Page, shots: Shot[], totalMs: number): Promise<void> {
+  private async runWalkthrough(
+    page: Page,
+    beats: Beat[],
+    totalMs: number,
+    gate: CaptureGate,
+    identity?: DummyIdentity,
+  ): Promise<void> {
     const startedAt = Date.now();
-    for (const shot of shots) {
-      const dueAt = startedAt + shot.atSec * 1000;
-      const wait = dueAt - Date.now();
+
+    for (const beat of beats) {
+      const framing = beat.reframe !== false && !!beat.selector;
+      const dueAt = startedAt + beat.atSec * 1000;
+      const wait = (framing ? dueAt - CAMERA_MOVE_MS : dueAt) - Date.now();
       if (wait > 0) await this.delay(wait);
       if (totalMs && Date.now() - startedAt >= totalMs) break;
+
       try {
-        await page.evaluate(applyShot, shot.selector, shot.zoom, shot.highlight);
-      } catch {
-        // A selector can stop resolving if the page re-rendered. Skip the shot
-        // rather than abandoning the rest of the sequence.
+        await this.performBeat(page, beat, framing, gate, identity);
+      } catch (err) {
+        // A selector stops resolving whenever the app re-renders differently
+        // from how the scout found it. Skip the beat rather than abandoning
+        // the rest of the walkthrough.
+        console.warn(`[recorder] beat at ${beat.atSec}s (${beat.action}) failed:`, describeError(err));
       }
     }
+
     // Ease out so the video does not end mid-push.
-    await page.evaluate(resetCamera).catch(() => undefined);
+    await page.evaluate(resetCamera, 900).catch(() => undefined);
+  }
+
+  private async performBeat(
+    page: Page,
+    beat: Beat,
+    framing: boolean,
+    gate: CaptureGate,
+    identity?: DummyIdentity,
+  ): Promise<void> {
+    if (beat.action === 'goto') {
+      if (!beat.url) return;
+      await page.goto(beat.url, { waitUntil: 'domcontentloaded', timeout: this.navigationTimeoutMs });
+      await page.waitForNetworkIdle({ idleTime: 350, timeout: 4_000 }).catch(() => undefined);
+      await this.instrumentPage(page);
+      if (beat.selector) await this.frame(page, beat);
+      return;
+    }
+
+    if (!beat.selector) return;
+
+    // A previous beat may have navigated, which takes the overlays with it.
+    await this.instrumentPage(page);
+    if (framing) await this.frame(page, beat);
+
+    if (beat.action === 'click') {
+      await this.pointAndClick(page, beat.selector, gate);
+      await this.delay(POST_CLICK_MS);
+      // Re-install in case that click was the thing that navigated.
+      await this.instrumentPage(page);
+      return;
+    }
+
+    if (beat.action === 'type') {
+      const value = identity ? resolveTokens(beat.value ?? '', identity) : (beat.value ?? '');
+      if (!value) return;
+      await this.pointAndClick(page, beat.selector, gate);
+      // Typed rather than assigned: a controlled React input ignores a value
+      // set on the element, and the viewer should see the characters appear.
+      await page.keyboard.type(value, { delay: TYPE_DELAY_MS });
+      return;
+    }
+
+    // 'hold' and 'scrollTo' are camera-only; framing above was the whole beat.
+  }
+
+  /** Run one camera move and wait for it to settle. */
+  private async frame(page: Page, beat: Beat): Promise<void> {
+    if (!beat.selector) return;
+    await page.evaluate(moveCamera, beat.selector, beat.zoom, beat.highlight, CAMERA_MOVE_MS);
+  }
+
+  /**
+   * Glide the visible pointer onto the element, then click where it landed.
+   *
+   * Clicking the returned coordinates rather than the selector matters twice
+   * over: the pointer the viewer sees and the click the browser makes can never
+   * disagree, and Puppeteer's selector click scrolls the element into view,
+   * which would yank the page out from under the camera mid-shot.
+   */
+  private async pointAndClick(page: Page, selector: string, gate: CaptureGate): Promise<void> {
+    const point = await page.evaluate(moveCursorTo, selector).catch(() => null);
+    if (!point) {
+      await gate.input(() => page.click(selector, { delay: 40 })).catch(() => undefined);
+      return;
+    }
+    await this.delay(CURSOR_GLIDE_MS);
+    await page.evaluate(cursorPulse).catch(() => undefined);
+    await gate.input(() => page.mouse.click(point.x, point.y, { delay: 40 }));
+  }
+
+  /**
+   * Make the page ready for camera calls. Cheap and idempotent, so it can be
+   * run before every beat rather than tracking navigations.
+   *
+   * tsx/esbuild wraps transpiled functions with a `__name` helper to preserve
+   * Function.prototype.name. page.evaluate() ships the function's *source* to
+   * the browser, where that helper doesn't exist — so every camera call died
+   * with "__name is not defined" and silently fell back to scrolling. The shim
+   * is registered on new documents too, so it survives the walkthrough's own
+   * navigations. Passed as a string on purpose: string arguments aren't
+   * transpiled, so this one line can't itself depend on the helper it installs.
+   */
+  private async instrumentPage(page: Page): Promise<void> {
+    await page.evaluate(SHIM_SOURCE);
+    await page.evaluate(installCinematics);
+    // A consent wall would swallow every click of the walkthrough and put a
+    // modal in the opening shot. Self-limiting to once per document, so this
+    // stays cheap even though it runs before every beat.
+    const dismissed = await page.evaluate(dismissOverlays).catch(() => null);
+    if (dismissed) console.log(`[recorder] dismissed an overlay via "${dismissed}"`);
   }
 
   private async scrollToBottom(page: Page): Promise<void> {

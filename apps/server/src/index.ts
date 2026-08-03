@@ -10,6 +10,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import { DaytonaDeployer, DaytonaDeploymentError } from './DaytonaDeployer';
 import { SandboxRecorder } from './SandboxRecorder';
 import { Recorder, RecorderError } from './Recorder';
+import { SiteScout } from './SiteScout';
 import { RepositoryCloner, RepositoryClonerError } from './RepositoryCloner';
 import { CodebaseAnalyzer } from './CodebaseAnalyzer';
 import { FlowExtractor } from './FlowExtractor';
@@ -28,6 +29,7 @@ import { SessionCapacityError } from './SessionStore';
 import { TelemetryRecorder } from './usage/TelemetryRecorder';
 import { mintApiKey } from './auth/apiKeys';
 import { assertSafeUrl, BlockedUrlError } from './security/urlGuard';
+import { parseAppEnv, AppEnvError, describeAppEnv } from './security/appEnv';
 import {
   globalLimiter,
   startPipelineLimiter,
@@ -39,6 +41,9 @@ import {
 const app: Express = express();
 const PORT = process.env.PORT || 3001;
 const recorder = new Recorder();
+// Explores a target app before the camera rolls, so the recording can show the
+// product being used rather than a tour of its front page.
+const siteScout = new SiteScout();
 const repositoryCloner = new RepositoryCloner();
 const codebaseAnalyzer = new CodebaseAnalyzer();
 const flowExtractor = new FlowExtractor();
@@ -107,11 +112,12 @@ const orchestrator = new PipelineOrchestrator({
   flowExtractor,
   // Records a deployed/public URL directly (no Daytona required).
   urlRecorder: recorder,
+  siteScout,
   // Records a GitHub repo by building + running it inside a Daytona sandbox.
   sandboxRecorder: sandboxRecorder ?? undefined,
   publicMediaPrefix: '/sessions',
   // Fires when a run actually finishes, which is the only point where the token
-  // totals include every stage (the cinematographer runs after approval).
+  // totals include every stage (the director runs after approval).
   onSessionComplete: (session, usage) => {
     telemetry?.record({
       userId: session.userId,
@@ -215,6 +221,8 @@ type RecordRequestBody = {
   sandboxPort?: number;
   appStartCommand?: string;
   appBuildCommand?: string;
+  /** Environment the repo needs to boot: object, or `.env`-style text. */
+  appEnv?: Record<string, string> | string;
 };
 
 // Behind Caddy, so the client IP arrives in X-Forwarded-For. Without this every
@@ -260,7 +268,21 @@ app.post('/api/record', auth, sandboxLimiter, async (req: Request, res: Response
     sandboxPort,
     appStartCommand,
     appBuildCommand,
+    appEnv,
   } = req.body as RecordRequestBody;
+
+  // Validated before anything is spent. A rejected variable should cost the
+  // caller a 400, not a ten-minute sandbox that fails at the end.
+  let parsedAppEnv: Record<string, string>;
+  try {
+    parsedAppEnv = parseAppEnv(appEnv);
+  } catch (error) {
+    if (error instanceof AppEnvError) {
+      res.status(400).json({ error: error.message, code: 'INVALID_APP_ENV' });
+      return;
+    }
+    throw error;
+  }
 
   const authed = req as AuthedRequest;
   telemetry?.record({
@@ -302,6 +324,7 @@ app.post('/api/record', auth, sandboxLimiter, async (req: Request, res: Response
           typeof appBuildCommand === 'string' && appBuildCommand.trim().length > 0
             ? appBuildCommand.trim()
             : undefined,
+        appEnv: parsedAppEnv,
       });
 
       res.status(202).json({
@@ -492,6 +515,7 @@ app.post('/api/pipeline/start', auth, startPipelineLimiter, async (req: Request,
     appStartCommand,
     appBuildCommand,
     sandboxPort,
+    appEnv,
     userPrompt,
     targetDurationSec,
     selectedStages,
@@ -505,6 +529,7 @@ app.post('/api/pipeline/start', auth, startPipelineLimiter, async (req: Request,
     appStartCommand?: string;
     appBuildCommand?: string;
     sandboxPort?: number;
+    appEnv?: Record<string, string> | string;
     userPrompt?: string;
     targetDurationSec?: number;
     selectedStages?: string[];
@@ -512,6 +537,18 @@ app.post('/api/pipeline/start', auth, startPipelineLimiter, async (req: Request,
     llm?: { provider?: string; apiKey?: string; model?: string };
     elevenLabsApiKey?: string;
   };
+
+  // Same as /api/record: fail the request, not the run, on a bad variable.
+  let parsedAppEnv: Record<string, string>;
+  try {
+    parsedAppEnv = parseAppEnv(appEnv);
+  } catch (error) {
+    if (error instanceof AppEnvError) {
+      res.status(400).json({ error: error.message, code: 'INVALID_APP_ENV' });
+      return;
+    }
+    throw error;
+  }
 
   if (!userPrompt || typeof userPrompt !== 'string' || !userPrompt.trim()) {
     res.status(400).json({ error: 'A `userPrompt` field is required.' });
@@ -553,6 +590,7 @@ app.post('/api/pipeline/start', auth, startPipelineLimiter, async (req: Request,
       appStartCommand: typeof appStartCommand === 'string' && appStartCommand.trim() ? appStartCommand.trim() : undefined,
       appBuildCommand: typeof appBuildCommand === 'string' && appBuildCommand.trim() ? appBuildCommand.trim() : undefined,
       sandboxPort: typeof sandboxPort === 'number' && Number.isInteger(sandboxPort) ? sandboxPort : undefined,
+      appEnv: parsedAppEnv,
       userPrompt: userPrompt.trim(),
       targetDurationSec:
         typeof targetDurationSec === 'number' && Number.isFinite(targetDurationSec) ? targetDurationSec : undefined,
@@ -561,6 +599,10 @@ app.post('/api/pipeline/start', auth, startPipelineLimiter, async (req: Request,
       llm: llmConfig,
       elevenLabsApiKey: audioKey,
     });
+
+    if (Object.keys(parsedAppEnv).length) {
+      console.log(`[pipeline ${session.id}] app environment: ${describeAppEnv(parsedAppEnv)}`);
+    }
 
     // Heartbeat: what was built, on what, with which provider — no prompt text,
     // and the target only as a hash (see TelemetryRecorder).

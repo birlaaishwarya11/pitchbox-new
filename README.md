@@ -121,7 +121,7 @@ Set `RECORDER_ENABLE_XVFB` / `RECORDER_DISABLE_XVFB` to override the default aut
 
 ##### GitHub-powered recording
 
-Pass `githubUrl` (plus optional `branch`, `commitId`, `workspaceDir`, `skipSetup`, `sandboxPort`, `sandboxRecordDurationMs`, `appStartCommand`, `appBuildCommand`) to let the server:
+Pass `githubUrl` (plus optional `branch`, `commitId`, `workspaceDir`, `skipSetup`, `sandboxPort`, `sandboxRecordDurationMs`, `appStartCommand`, `appBuildCommand`, `appEnv`) to let the server:
 
 1. Provision a Daytona sandbox via [`@daytonaio/sdk`](https://www.daytona.io/docs/en/typescript-sdk/)
 2. Clone and auto-configure the repo (installs `xvfb`, `ffmpeg`, `curl`, runs `npm install`)
@@ -173,6 +173,47 @@ curl -X POST http://localhost:3001/api/record \
 
 Use `skipSetup` if the repository already contains all dependencies, `sandboxPort` to override the default preview port, `appBuildCommand` to customize the pre-start build step (defaults to `npm run build:web`), and `appStartCommand` to launch a custom process (defaults to `npm run dev:web`). Recorder logs live inside the sandbox (`/tmp/pitchbox-app.log` for the app, `/tmp/pitchbox-recorder.log` for the remote recorder) so you can SSH in and tail them while a run is in progress. Raw MP4s are staged under `/tmp/pitchbox-recorder-runtime/` until the server downloads them.
 
+###### Environment variables for the app under test (`appEnv`)
+
+Most projects will not boot without configuration, and an app that never starts cannot be recorded. Pass `appEnv` as either an object or `.env`-style text:
+
+```jsonc
+{
+  "githubUrl": "https://github.com/owner/repo",
+  "appStartCommand": "npm run dev",
+  "sandboxPort": 3000,
+  "appEnv": {
+    "DATABASE_URL": "postgres://…",
+    "NEXT_PUBLIC_API_URL": "https://api.example.com"
+  }
+}
+```
+
+They are written to `.env.local` in the cloned repo (never overwriting a committed `.env`) *and* passed to the build and start commands, so both file-based loaders and `process.env` readers see them.
+
+**Handling and limits**
+
+| | |
+|---|---|
+| Storage | Held in memory for the life of the run only. Never written to the session, so `GET /api/pipeline/:id` cannot return them. |
+| Logging | Names only, never values — a boot failure reports `3 (DATABASE_URL, …)`. |
+| LLM | Never sent to any model. The director sees the site map, not the environment. |
+| Count | 40 variables maximum |
+| Value size | 4096 characters each |
+| Total size | 16 KB |
+| Names | `[A-Za-z_][A-Za-z0-9_]*` |
+| Reserved | `PORT`, `HOST`, `HOSTNAME`, `VITE_PORT`, `PATH`, `NODE_OPTIONS`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `BASH_ENV`, `SHELL`, `IFS`, and the `RECORDER_*` / `PUPPETEER_*` / `DAYTONA_*` / `PBX_*` prefixes are rejected — the recorder sets them, and use `sandboxPort` to change the port. |
+
+Anything rejected fails the request with `400 INVALID_APP_ENV` and a message naming the variable, so a bad value costs a round trip rather than a ten-minute sandbox.
+
+###### When a repo will not start
+
+The readiness check waits up to 120s for the app to answer on its port. If it never does, the error carries the last 40 lines of `/tmp/pitchbox-app.log`, the names supplied via `appEnv`, and a guess at the cause read out of the log (a named missing variable, `EADDRINUSE`, a missing module, an unreachable database).
+
+A dev server also answers HTTP 200 while rendering its *own* error overlay, so a status check alone calls a completely broken app ready. The scout therefore checks whether the entry page is a Next.js / Vite / Remix error overlay before exploring, and a repo run fails with that overlay's text rather than recording 40 seconds of a stack trace.
+
+Sandboxes are deleted when a run succeeds. A failed run keeps its sandbox for 60 minutes so the logs can be read, then auto-deletes; `PITCHBOX_KEEP_SANDBOX=true` keeps every sandbox, and `PITCHBOX_FAILED_SANDBOX_TTL_MIN` changes the window. Repo recordings are **not** retried: the run is long and its failures are deterministic, so a second attempt only delays the diagnostic.
+
 #### Daytona Deployment API
 
 `POST /api/deploy` provisions a Daytona sandbox (via [`@daytonaio/sdk`](https://www.daytona.io/docs/en/typescript-sdk/)), optionally pins it to a branch/commit, clones the target GitHub repository, and **auto-configures the sandbox** so it's ready to run Pitchbox (installs `xvfb`, `ffmpeg`, and runs `npm install` in the repo). Pass `skipSetup: true` if you only need the clone.
@@ -183,6 +224,11 @@ Use `skipSetup` if the repository already contains all dependencies, `sandboxPor
 - `DAYTONA_API_URL` *(optional — defaults to Daytona Cloud)*
 - `DAYTONA_TARGET` *(optional — lets you pin a specific runner target)*
 - `DAYTONA_WORKSPACE_DIR` *(optional — base folder used for clones, defaults to `workspace`)*
+- `PITCHBOX_KEEP_SANDBOX` *(optional — `true` keeps every sandbox instead of deleting it after a successful run)*
+- `PITCHBOX_FAILED_SANDBOX_TTL_MIN` *(optional — minutes a failed run's sandbox is kept for inspection, default `60`)*
+- `DAYTONA_SANDBOX_TTL_MIN` *(optional — auto-delete interval set at creation so a sandbox cannot outlive a crashed server, default `120`)*
+- `DAYTONA_SANDBOX_IMAGE` *(optional — create sandboxes from this image instead of the default snapshot; **required** before any resource override below has an effect, because only image-based sandboxes accept a resource allocation)*
+- `DAYTONA_SANDBOX_CPU`, `DAYTONA_SANDBOX_MEMORY_GIB`, `DAYTONA_SANDBOX_DISK_GIB` *(optional — resource allocation; use these when a repo's `npm install` is killed with exit 137, which is the out-of-memory killer)*
 
 **Request**
 

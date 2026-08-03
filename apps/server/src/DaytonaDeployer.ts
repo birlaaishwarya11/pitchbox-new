@@ -15,6 +15,14 @@ export interface DeployFromGithubInput {
   commitId?: string;
   workspaceDir?: string;
   skipSetup?: boolean;
+  /**
+   * Environment for every process in the sandbox, set at creation.
+   *
+   * Set here as well as on the individual commands because a dev server often
+   * spawns children, and inheriting from the sandbox itself is the only way they
+   * all see the same configuration.
+   */
+  envVars?: Record<string, string>;
 }
 
 export interface DeploymentResult {
@@ -100,7 +108,7 @@ const DEFAULT_SETUP_COMMANDS_FACTORY: SetupCommandFactory = ({ repoPath }) => [
   {
     id: 'apt-update',
     description: 'Update apt package index',
-    command: 'sudo apt-get update',
+    command: 'bash -lc \'${SUDO:-$(command -v sudo || true)} apt-get update\'',
     timeoutSec: 300,
   },
   {
@@ -111,10 +119,13 @@ const DEFAULT_SETUP_COMMANDS_FACTORY: SetupCommandFactory = ({ repoPath }) => [
     // Chromium needs. Fall back across package names and expose a stable path.
     command:
       "bash -lc 'set -e; " +
-      'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg curl xvfb ca-certificates fonts-liberation; ' +
-      '(sudo DEBIAN_FRONTEND=noninteractive apt-get install -y chromium || sudo DEBIAN_FRONTEND=noninteractive apt-get install -y chromium-browser); ' +
+      // `sudo` is absent from most base images, where the user is already root.
+      // Resolving it at run time keeps this working on both.
+      'S="$(command -v sudo || true)"; ' +
+      '$S DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg curl xvfb ca-certificates fonts-liberation; ' +
+      '($S DEBIAN_FRONTEND=noninteractive apt-get install -y chromium || $S DEBIAN_FRONTEND=noninteractive apt-get install -y chromium-browser); ' +
       'if [ ! -e /usr/bin/chromium ]; then P="$(command -v chromium || command -v chromium-browser || true)"; ' +
-      '[ -n "$P" ] && sudo ln -sf "$P" /usr/bin/chromium || true; fi; ' +
+      '[ -n "$P" ] && $S ln -sf "$P" /usr/bin/chromium || true; fi; ' +
       "/usr/bin/chromium --version || true'",
     timeoutSec: 420,
   },
@@ -129,6 +140,21 @@ const DEFAULT_SETUP_COMMANDS_FACTORY: SetupCommandFactory = ({ repoPath }) => [
     },
   },
 ];
+
+/** CPU/memory/disk overrides from the environment, or undefined if none are set. */
+function readResourceOverrides(): { cpu?: number; memory?: number; disk?: number } | undefined {
+  const read = (name: string): number | undefined => {
+    const raw = process.env[name];
+    if (!raw) return undefined;
+    const value = Number.parseInt(raw, 10);
+    return Number.isFinite(value) && value > 0 ? value : undefined;
+  };
+  const cpu = read('DAYTONA_SANDBOX_CPU');
+  const memory = read('DAYTONA_SANDBOX_MEMORY_GIB');
+  const disk = read('DAYTONA_SANDBOX_DISK_GIB');
+  if (cpu === undefined && memory === undefined && disk === undefined) return undefined;
+  return { ...(cpu !== undefined ? { cpu } : {}), ...(memory !== undefined ? { memory } : {}), ...(disk !== undefined ? { disk } : {}) };
+}
 
 export class DaytonaDeployer {
   private readonly daytona: Daytona;
@@ -153,7 +179,7 @@ export class DaytonaDeployer {
     }
 
     const repoInfo = parseGithubUrl(trimmedUrl);
-    const sandbox = await this.createSandbox();
+    const sandbox = await this.createSandbox(input.envVars);
 
     try {
       await sandbox.waitUntilStarted(this.runtimeOptions.startTimeoutSec);
@@ -193,11 +219,46 @@ export class DaytonaDeployer {
     };
   }
 
-  private async createSandbox(): Promise<Sandbox> {
+  /**
+   * Create the sandbox this run will use.
+   *
+   * Two knobs matter here, both learned the hard way.
+   *
+   * `autoDeleteInterval` is set at creation rather than after the run, so a
+   * sandbox cannot outlive a server that crashes mid-recording. The account had
+   * accumulated a year of stale sandboxes because cleanup only ever happened on
+   * the happy path.
+   *
+   * `DAYTONA_SANDBOX_IMAGE` opts into image-based creation, which is the only
+   * form that accepts a CPU/memory/disk allocation. The default snapshot could
+   * not `npm install` a mid-sized monorepo — the step was OOM-killed at exit
+   * 137 — and there is no way to ask for more memory without naming an image.
+   * Unset, behaviour is exactly as before.
+   */
+  private async createSandbox(envVars?: Record<string, string>): Promise<Sandbox> {
+    const idleMinutes = Number.parseInt(process.env.DAYTONA_SANDBOX_TTL_MIN ?? '120', 10) || 120;
+    const base = {
+      ...(envVars && Object.keys(envVars).length ? { envVars } : {}),
+      autoDeleteInterval: idleMinutes,
+    };
+
+    const image = process.env.DAYTONA_SANDBOX_IMAGE?.trim();
+    const resources = readResourceOverrides();
+
     try {
-      return await this.daytona.create(undefined, {
-        timeout: this.runtimeOptions.createTimeoutSec,
-      });
+      if (image) {
+        return await this.daytona.create(
+          { ...base, image, ...(resources ? { resources } : {}) },
+          { timeout: this.runtimeOptions.createTimeoutSec },
+        );
+      }
+      if (resources) {
+        console.warn(
+          '[daytona] DAYTONA_SANDBOX_CPU/MEMORY_GIB/DISK_GIB are ignored without DAYTONA_SANDBOX_IMAGE — ' +
+            'only image-based sandboxes accept a resource allocation.',
+        );
+      }
+      return await this.daytona.create(base, { timeout: this.runtimeOptions.createTimeoutSec });
     } catch (error) {
       throw new DaytonaDeploymentError('DAYTONA_CREATE_FAILED', 'Unable to create Daytona sandbox.', error);
     }
@@ -308,9 +369,29 @@ export class DaytonaDeployer {
       results.push(result);
 
       if (result.exitCode !== 0) {
+        // The exit code alone is close to useless to whoever gets this back. 137
+        // in particular reads as an arbitrary number when it means the step was
+        // killed for using too much memory — which a large `npm install` in a
+        // small sandbox does, and which no amount of retrying will fix.
+        const tail = output.trim().split(/\r?\n/).slice(-25).join('\n');
+        const cause =
+          result.exitCode === 137
+            ? 'It was killed, which on a sandbox this size almost always means it ran out of memory. ' +
+              'A large dependency install is the usual culprit — try a lighter branch, a prebuilt ' +
+              'image, or `skipSetup` with dependencies already vendored.'
+            : result.exitCode === 124
+              ? 'It timed out.'
+              : undefined;
+
         throw new DaytonaDeploymentError(
           'SANDBOX_SETUP_FAILED',
-          `Setup step "${command.description}" exited with code ${result.exitCode}.`,
+          [
+            `Setup step "${command.description}" exited with code ${result.exitCode}.`,
+            cause,
+            tail ? `Last output:\n${tail}` : undefined,
+          ]
+            .filter(Boolean)
+            .join('\n\n'),
           result,
         );
       }

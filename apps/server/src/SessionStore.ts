@@ -81,7 +81,18 @@ export interface PipelineSession {
   research?: ResearchArtifact;
   scriptVersions: ScriptVersion[];
   approvedVersionId?: string;
-  audio?: { url: string; fileName: string; bytes: number; durationEstimateMs: number };
+  audio?: {
+    url: string;
+    fileName: string;
+    bytes: number;
+    durationEstimateMs: number;
+    /**
+     * Hash of the script this audio was read from. Voiceover is the one stage
+     * billed per run, so an identical script must not be paid for twice —
+     * re-recording the video after tweaking nothing but the footage reuses it.
+     */
+    scriptHash?: string;
+  };
   video?: { url: string; fileName: string };
   finalVideo?: { url: string; fileName: string };
   workDir: string;

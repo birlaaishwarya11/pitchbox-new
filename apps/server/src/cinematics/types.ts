@@ -1,10 +1,11 @@
 /**
- * Shot planning for the screen recording.
+ * Shot and walkthrough planning for the screen recording.
  *
- * A flat top-to-bottom scroll shows everything and emphasises nothing. A shot
- * list lets the camera behave like a presenter: settle on the headline while
- * the narration introduces the product, push in on the button it mentions, hold
- * on the thing being described.
+ * A flat top-to-bottom scroll of the landing page shows everything and
+ * emphasises nothing — and it never shows the product actually being used. A
+ * walkthrough lets the recording behave like a presenter driving the app: open
+ * on the headline, click into the real flow, type into the real fields, and
+ * frame whatever the narration is describing at that moment.
  */
 
 /** A candidate element the camera could point at, harvested from the page. */
@@ -19,22 +20,119 @@ export interface PageTarget {
   top: number;
 }
 
-export interface Shot {
-  /** Selector from the supplied targets. Unresolvable selectors are skipped. */
+/** One fillable control inside a form. */
+export interface FormField {
   selector: string;
-  /** Seconds into the video when this shot should begin. */
-  atSec: number;
-  /** How long to stay on it. */
-  holdSec: number;
-  /**
-   * 1 = no zoom (wide). Values above 1 push in. Kept modest by the planner —
-   * past roughly 2x, layout artefacts on fixed headers become obvious.
-   */
-  zoom: number;
-  /** Draw an attention ring around the element for this shot. */
-  highlight: boolean;
+  /** Normalised control type — drives which dummy value gets typed in. */
+  kind:
+    | 'text'
+    | 'email'
+    | 'password'
+    | 'number'
+    | 'tel'
+    | 'url'
+    | 'search'
+    | 'date'
+    | 'textarea'
+    | 'select'
+    | 'checkbox'
+    | 'radio';
+  /** Best available human label: <label>, aria-label, placeholder, then name. */
+  label: string;
+  name: string;
+  required: boolean;
 }
 
-export interface ShotPlan {
-  shots: Shot[];
+/** A form the walkthrough could fill in and submit. */
+export interface FormTarget {
+  selector: string;
+  /** Heading or legend nearest the form, used to describe it to the planner. */
+  label: string;
+  fields: FormField[];
+  /** The submit control, when one could be identified. */
+  submitSelector?: string;
+  submitText?: string;
+}
+
+/** A same-origin link the walkthrough could follow. */
+export interface LinkTarget {
+  selector: string;
+  text: string;
+  /** Absolute URL, always same-origin as the entry point. */
+  href: string;
+}
+
+/** Everything harvested from one screen the scout reached. */
+export interface ScreenSnapshot {
+  url: string;
+  /** Pathname + search, which is what the planner should reason about. */
+  path: string;
+  title: string;
+  /** Plain-English description of how the scout arrived here. */
+  reachedBy: string;
+  targets: PageTarget[];
+  forms: FormTarget[];
+  links: LinkTarget[];
+}
+
+/** The result of the scouting pass: every screen reached, in visit order. */
+export interface SiteMap {
+  origin: string;
+  entryUrl: string;
+  screens: ScreenSnapshot[];
+  /** Non-fatal problems worth surfacing (auth wall hit, budget exhausted, …). */
+  notes: string[];
+  /**
+   * Set when the entry page was a framework error overlay rather than the app.
+   *
+   * Fatal for a repo run: the project started, answered HTTP 200, and rendered
+   * its own stack trace. Recording that produces a video of an error, so the
+   * caller is told what the app said instead.
+   */
+  appError?: string;
+}
+
+/**
+ * What the recorder does at a moment in the video.
+ *
+ * `hold` and `scrollTo` are camera-only; the rest drive the app. Every beat
+ * also carries its framing, so an action and the shot that covers it are one
+ * decision rather than two lists to keep in sync.
+ */
+export type BeatAction = 'hold' | 'goto' | 'click' | 'type' | 'scrollTo';
+
+export interface Beat {
+  /** Seconds into the video when this beat should begin. */
+  atSec: number;
+  action: BeatAction;
+  /** Target element. Required for click/type/scrollTo, optional for hold. */
+  selector?: string;
+  /** Destination for `goto`. Must be same-origin with the entry point. */
+  url?: string;
+  /**
+   * Text to type. May contain `{{email}}`-style identity tokens, which the
+   * recorder substitutes — so a plan can never leak a real-looking secret and
+   * the same dummy account is used consistently across the whole walkthrough.
+   */
+  value?: string;
+  /**
+   * 1 = no zoom (wide). Kept restrained by the planner and clamped by the
+   * director: past a mild push the surrounding context is cropped away and the
+   * viewer no longer knows where they are.
+   */
+  zoom: number;
+  /** Draw an attention ring around the element for this beat. */
+  highlight: boolean;
+  /**
+   * Whether this beat moves the camera. The director clears it when a beat
+   * lands too soon after the previous move: the action still happens, but the
+   * frame it happens in is inherited rather than re-aimed. Defaults to true.
+   */
+  reframe?: boolean;
+  /** Short note on intent — logged, never rendered. */
+  note?: string;
+}
+
+export interface Walkthrough {
+  beats: Beat[];
 }

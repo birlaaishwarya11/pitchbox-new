@@ -1,11 +1,15 @@
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { mkdir, copyFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { mkdir, copyFile, access } from 'node:fs/promises';
 import type { SessionStore, PipelineSession, ScriptVersion } from './SessionStore';
 import { Planner } from './Planner';
 import { Researcher } from './Researcher';
 import { Scripter } from './Scripter';
-import { Cinematographer } from './Cinematographer';
+import { Director } from './Director';
+import type { SiteScout } from './SiteScout';
+import { makeDummyIdentity, type DummyIdentity } from './cinematics/dummyIdentity';
+import type { Beat, SiteMap } from './cinematics/types';
 import { createLlmClient, type LlmConfig } from './llm/createLlmClient';
 import type { LlmClient } from './llm/LlmClient';
 import { AudioGenerator } from './AudioGenerator';
@@ -21,6 +25,17 @@ import { mediaSemaphore } from './concurrency';
 
 // Recording is the flakiest stage; total attempts = 1 try + (this - 1) retries.
 const RECORD_MAX_ATTEMPTS = 2;
+/**
+ * Sandbox recordings are not retried.
+ *
+ * A repo run is provision, clone, apt, install, build, start, scout, record —
+ * ten minutes or more — and when it fails it is almost always for a reason a
+ * second identical attempt will hit again: a missing environment variable, a
+ * wrong start command, a port that never opens. Retrying just spends another ten
+ * minutes and another sandbox to reach the same error, and delays the diagnostic
+ * that would actually help.
+ */
+const SANDBOX_RECORD_MAX_ATTEMPTS = 1;
 
 /** Duration of a media file in ms, or 0 if it cannot be probed. */
 function probeDurationMs(filePath: string): Promise<number> {
@@ -43,8 +58,8 @@ interface SessionAgents {
   planner: Planner;
   researcher: Researcher;
   scripter: Scripter;
-  // Plans the camera moves over the recording, on the run's own LLM key.
-  cinematographer: Cinematographer;
+  // Plans what the app does on camera and how it is framed, on the run's own key.
+  director: Director;
   // The shared client behind all four agents — carries this run's token totals.
   llmClient: LlmClient;
   // Bound per session: voiceover is billed to whoever's ElevenLabs key ran it,
@@ -68,6 +83,10 @@ export interface PipelineDeps {
   // Records a plain URL locally (Puppeteer + ffmpeg) — used when a deployed
   // `recordUrl` is supplied instead of a GitHub repo + Daytona sandbox.
   urlRecorder?: Recorder;
+  // Explores the app before the camera rolls, so the director has somewhere to
+  // point beyond the landing page. Optional: without it, recording degrades to
+  // the old scroll-the-front-page behaviour rather than failing.
+  siteScout?: SiteScout;
   // Renders a branded slate PNG when there is no screen recording.
   slateRenderer?: SlateRenderer;
   // Public URL prefix for static-served session files. Final URLs become
@@ -83,6 +102,11 @@ export interface PipelineDeps {
   onSessionComplete?: (session: PipelineSession, usage: { inputTokens: number; outputTokens: number; calls: number }) => void;
 }
 
+interface PlannedWalkthrough {
+  beats: Beat[];
+  identity: DummyIdentity;
+}
+
 export interface StartInput {
   githubUrl?: string;
   branch?: string;
@@ -92,6 +116,11 @@ export interface StartInput {
   appStartCommand?: string;
   appBuildCommand?: string;
   sandboxPort?: number;
+  /**
+   * Environment the repo needs to boot. Held off the session object on purpose —
+   * see `appEnvBySession` — so it never reaches an API response or a log.
+   */
+  appEnv?: Record<string, string>;
   userPrompt: string;
   targetDurationSec?: number;
   // Which optional stages to run. Required stages always run; dependencies are
@@ -113,6 +142,21 @@ export interface StartInput {
 export class PipelineOrchestrator {
   // Per-session LLM agents, built from the run's chosen provider/key/model.
   private readonly agentsBySession = new Map<string, SessionAgents>();
+  // Scouting drives a real browser around the app for up to two minutes. The
+  // map it produces depends on the app, not on the script, so it is kept across
+  // retries and script iterations; only the director re-runs when the words
+  // change, since the beats are timed against them.
+  private readonly siteMapBySession = new Map<string, SiteMap>();
+  /**
+   * Environment for the app being recorded, kept beside the session rather than
+   * on it.
+   *
+   * These are the caller's real credentials. `PipelineSession` is serialised
+   * wholesale into every `GET /api/pipeline/:id` response, so a field on
+   * `session.input` would hand them back over HTTP and put them in any log line
+   * that dumps a session. Off to the side, only the recording stage can see them.
+   */
+  private readonly appEnvBySession = new Map<string, Record<string, string>>();
 
   constructor(private readonly deps: PipelineDeps) {}
 
@@ -122,7 +166,7 @@ export class PipelineOrchestrator {
       planner: new Planner(client),
       researcher: new Researcher(client),
       scripter: new Scripter(client),
-      cinematographer: new Cinematographer(client),
+      director: new Director(client),
       llmClient: client,
       audioGenerator,
     };
@@ -161,6 +205,9 @@ export class PipelineOrchestrator {
       selected,
     );
     this.agentsBySession.set(session.id, agents);
+    if (input.appEnv && Object.keys(input.appEnv).length) {
+      this.appEnvBySession.set(session.id, input.appEnv);
+    }
 
     void this.runScriptStages(session.id, selected, agents).catch((err) => {
       console.error(`[pipeline ${session.id}] script-stage failure:`, err);
@@ -225,7 +272,10 @@ export class PipelineOrchestrator {
     return this.deps.store.update(sessionId, (s) => {
       s.status = 'SCRIPT_DRAFT';
       s.approvedVersionId = undefined;
-      s.audio = undefined;
+      // `s.audio` is deliberately kept. It carries the hash of the script it
+      // was read from, so the next approval reuses it when the words end up
+      // unchanged and re-records when they don't — either way, nobody pays
+      // twice for the same sentences.
       s.video = undefined;
       s.finalVideo = undefined;
       s.error = undefined;
@@ -408,22 +458,38 @@ export class PipelineOrchestrator {
     }
 
     // 2. Voiceover, now that the footage is known good.
+    //
+    // Reuse it when the script has not changed a character. This is the only
+    // stage billed per run, and re-cutting the video after an unchanged script
+    // — a new take, a retry, a reiterate that ended up back where it started —
+    // would otherwise buy the identical audio a second time.
     store.setStage(sessionId, 'voiceover', { status: 'running' });
-    let audio;
-    try {
-      audio = await audioGenerator.generate(approvedScript.fullScript, { outputDir: sessionDir });
-      store.update(sessionId, (s) => {
-        s.audio = {
-          url: `${this.deps.publicMediaPrefix}/${sessionId}/${audio!.fileName}`,
-          fileName: audio!.fileName,
-          bytes: audio!.bytes,
-          durationEstimateMs: audio!.durationEstimateMs,
-        };
-      });
-      store.setStage(sessionId, 'voiceover', { status: 'done', message: `${Math.round(audio.bytes / 1024)} KB` });
-    } catch (err) {
-      store.setStage(sessionId, 'voiceover', { status: 'failed', message: String((err as any)?.message ?? err) });
-      throw err;
+    const scriptHash = hashScript(approvedScript.fullScript);
+    const reusable = await this.reusableAudio(session, scriptHash, sessionDir);
+
+    let audioPath: string;
+    if (reusable) {
+      audioPath = reusable;
+      store.setStage(sessionId, 'voiceover', { status: 'done', message: 'reused — script unchanged' });
+      console.log(`[pipeline ${sessionId}] reusing the existing voiceover; the script is unchanged.`);
+    } else {
+      try {
+        const audio = await audioGenerator.generate(approvedScript.fullScript, { outputDir: sessionDir });
+        audioPath = audio.filePath;
+        store.update(sessionId, (s) => {
+          s.audio = {
+            url: `${this.deps.publicMediaPrefix}/${sessionId}/${audio.fileName}`,
+            fileName: audio.fileName,
+            bytes: audio.bytes,
+            durationEstimateMs: audio.durationEstimateMs,
+            scriptHash,
+          };
+        });
+        store.setStage(sessionId, 'voiceover', { status: 'done', message: `${Math.round(audio.bytes / 1024)} KB` });
+      } catch (err) {
+        store.setStage(sessionId, 'voiceover', { status: 'failed', message: String((err as any)?.message ?? err) });
+        throw err;
+      }
     }
 
     // 2. Fuse
@@ -451,7 +517,7 @@ export class PipelineOrchestrator {
     }
 
     const fused = await this.deps.fuser.fuse({
-      audioPath: audio.filePath,
+      audioPath,
       videoPath: video?.filePath,
       outputDir: sessionDir,
       slateTitle: session.plan?.audience ? `Pitchbox · ${session.plan.audience}` : 'Pitchbox demo',
@@ -504,12 +570,20 @@ export class PipelineOrchestrator {
     // (provision → clone → install → build → run → record) needs far longer than
     // a direct URL capture.
     const isSandbox = !session.input.recordUrl && !!session.input.githubUrl;
-    const recordCeilingMs = isSandbox ? 12 * 60_000 : Math.max(recordDurationMs, 60_000) + 60_000;
+    // The sandbox leg now scouts the app before recording it, and that time
+    // sits inside this ceiling: provision, clone, install, build, start, wait
+    // for HTTP, explore, direct, record. Twelve minutes covered the old
+    // sequence with little to spare, so a scouted run would have started
+    // timing out and falling back to a slate — a regression dressed up as
+    // flakiness. Sized to leave room for a slow `npm install` on top.
+    const recordCeilingMs = isSandbox ? 18 * 60_000 : Math.max(recordDurationMs, 60_000) + 60_000;
     const label = session.input.recordUrl ? session.input.recordUrl : 'sandbox capture';
 
-    // Recording is the flakiest leg, so retry once before giving up.
+    // Recording is the flakiest leg, so retry once before giving up — except in
+    // a sandbox, where a failure is deterministic and a retry is very expensive.
+    const maxAttempts = isSandbox ? SANDBOX_RECORD_MAX_ATTEMPTS : RECORD_MAX_ATTEMPTS;
     let lastErr: unknown;
-    for (let attempt = 1; attempt <= RECORD_MAX_ATTEMPTS; attempt++) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const localPath = await this.recordOnce(session, recordDurationMs, recordCeilingMs);
         const filePath = await this.stageRecordedFile(sessionId, session, localPath);
@@ -520,8 +594,8 @@ export class PipelineOrchestrator {
         return { filePath };
       } catch (err) {
         lastErr = err;
-        console.warn(`[pipeline ${sessionId}] recording attempt ${attempt}/${RECORD_MAX_ATTEMPTS} failed:`, err);
-        if (attempt < RECORD_MAX_ATTEMPTS) {
+        console.warn(`[pipeline ${sessionId}] recording attempt ${attempt}/${maxAttempts} failed:`, err);
+        if (attempt < maxAttempts) {
           store.setStage(sessionId, 'record', {
             status: 'running',
             message: `attempt ${attempt} failed — retrying…`,
@@ -530,12 +604,96 @@ export class PipelineOrchestrator {
       }
     }
 
-    console.warn(`[pipeline ${sessionId}] recording failed after ${RECORD_MAX_ATTEMPTS} attempts, falling back to slate.`);
+    console.warn(`[pipeline ${sessionId}] recording failed after ${maxAttempts} attempt(s), falling back to slate.`);
     store.setStage(sessionId, 'record', {
       status: 'failed',
-      message: `failed after ${RECORD_MAX_ATTEMPTS} attempts — using slate. ${String((lastErr as any)?.message ?? lastErr)}`,
+      message: `failed after ${maxAttempts} attempt(s) — using slate.\n${String((lastErr as any)?.message ?? lastErr)}`,
     });
     return null;
+  }
+
+  /**
+   * Path to an existing voiceover that was read from this exact script, or
+   * undefined if there isn't one.
+   *
+   * Both halves have to hold: the hash has to match, and the file has to still
+   * be on disk. The session sweeper deletes work directories, and a session
+   * that outlives its own audio must re-record rather than hand the fuser a
+   * path to nothing.
+   */
+  private async reusableAudio(
+    session: PipelineSession,
+    scriptHash: string,
+    sessionDir: string,
+  ): Promise<string | undefined> {
+    const existing = session.audio;
+    if (!existing?.scriptHash || existing.scriptHash !== scriptHash) return undefined;
+    const filePath = path.join(sessionDir, existing.fileName);
+    try {
+      await access(filePath);
+      return filePath;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Scout the app, then have the director turn it into a timed walkthrough.
+   *
+   * Returns empty beats on any failure. That is deliberate: a run that cannot
+   * be scouted should still produce the old scroll-the-landing-page video
+   * rather than no video at all.
+   */
+  private async planWalkthrough(
+    session: PipelineSession,
+    recordUrl: string,
+    script: string | undefined,
+    recordDurationMs: number,
+  ): Promise<PlannedWalkthrough> {
+    // Two personas from one seed. The scout signs up to find out what is behind
+    // the login, which means that account already exists by the time the camera
+    // rolls — so the take needs its own, or the signup performed on screen
+    // collides with the one scouting just created.
+    const identity = makeDummyIdentity(`${session.id}:take`);
+
+    const director = this.agentsBySession.get(session.id)?.director;
+    const scout = this.deps.siteScout;
+    if (!scout || !director || !script) return { beats: [], identity };
+
+    const store = this.deps.store;
+    try {
+      let siteMap = this.siteMapBySession.get(session.id);
+      if (!siteMap) {
+        store.setStage(session.id, 'record', { status: 'running', message: 'exploring the app…' });
+        siteMap = await scout.explore(recordUrl, makeDummyIdentity(`${session.id}:scout`));
+        this.siteMapBySession.set(session.id, siteMap);
+        console.log(
+          `[pipeline ${session.id}] scouted ${siteMap.screens.length} screen(s): ` +
+            siteMap.screens.map((s) => s.path).join(', '),
+        );
+        for (const note of siteMap.notes) console.log(`[pipeline ${session.id}] scout: ${note}`);
+      }
+
+      store.setStage(session.id, 'record', { status: 'running', message: 'planning the walkthrough…' });
+      const walkthrough = await director.plan({
+        script,
+        durationSec: recordDurationMs / 1000,
+        siteMap,
+        identity,
+      });
+      const actions = walkthrough.beats.filter((b) => b.action !== 'hold' && b.action !== 'scrollTo').length;
+      console.log(
+        `[pipeline ${session.id}] directed ${walkthrough.beats.length} beats (${actions} interactions)`,
+      );
+
+      return { beats: walkthrough.beats, identity };
+    } catch (err) {
+      console.warn(
+        `[pipeline ${session.id}] walkthrough planning failed, the recording will scroll instead:`,
+        err,
+      );
+      return { beats: [], identity };
+    }
   }
 
   /** A single recording attempt against the configured target. Throws on failure. */
@@ -545,28 +703,29 @@ export class PipelineOrchestrator {
     recordCeilingMs: number,
   ): Promise<string> {
     if (session.input.recordUrl && this.deps.urlRecorder) {
-      const cinematographer = this.agentsBySession.get(session.id)?.cinematographer;
       const approved =
         session.scriptVersions.find((v) => v.id === session.approvedVersionId) ??
         session.scriptVersions[session.scriptVersions.length - 1];
 
+      const { beats, identity } = await this.planWalkthrough(
+        session,
+        session.input.recordUrl,
+        approved?.fullScript,
+        recordDurationMs,
+      );
+
+      this.deps.store.setStage(session.id, 'record', {
+        status: 'running',
+        message: beats.length ? `capturing ${beats.length}-beat walkthrough…` : 'capturing…',
+      });
+
       const rec = await withTimeout(
         this.deps.urlRecorder.record(session.input.recordUrl, {
           targetDurationMs: recordDurationMs,
-          // Only plan shots when we have both an agent and a script to time
-          // against. A failed plan falls back to scrolling inside the recorder.
-          planShots:
-            cinematographer && approved
-              ? async (targets) => {
-                  const plan = await cinematographer.plan({
-                    script: approved.fullScript,
-                    durationSec: recordDurationMs / 1000,
-                    targets,
-                  });
-                  console.log(`[pipeline ${session.id}] planned ${plan.shots.length} camera shots`);
-                  return plan.shots;
-                }
-              : undefined,
+          // Empty beats fall back to scrolling inside the recorder — a worse
+          // video, not a broken one.
+          beats,
+          identity,
         }),
         recordCeilingMs,
         'URL recording',
@@ -574,6 +733,12 @@ export class PipelineOrchestrator {
       return rec.localPath;
     }
     if (session.input.githubUrl && this.deps.sandboxRecorder) {
+      const director = this.agentsBySession.get(session.id)?.director;
+      const approved =
+        session.scriptVersions.find((v) => v.id === session.approvedVersionId) ??
+        session.scriptVersions[session.scriptVersions.length - 1];
+      const identity = makeDummyIdentity(`${session.id}:take`);
+
       const res = await withTimeout(
         this.deps.sandboxRecorder.recordRepository({
           githubUrl: session.input.githubUrl,
@@ -582,6 +747,24 @@ export class PipelineOrchestrator {
           appStartCommand: session.input.appStartCommand,
           appBuildCommand: session.input.appBuildCommand,
           appPort: session.input.sandboxPort,
+          appEnv: this.appEnvBySession.get(session.id),
+          // The sandbox scouts the app itself — only it can reach the app over
+          // localhost — and hands the map back here to be directed, because the
+          // run's LLM key stays on this side and never enters the sandbox.
+          scoutIdentity: makeDummyIdentity(`${session.id}:scout`),
+          planWalkthrough:
+            director && approved
+              ? async (siteMap) => {
+                  const { beats } = await director.plan({
+                    script: approved.fullScript,
+                    durationSec: recordDurationMs / 1000,
+                    siteMap,
+                    identity,
+                  });
+                  console.log(`[pipeline ${session.id}] directed ${beats.length} beats for the sandbox`);
+                  return { beats, identity };
+                }
+              : undefined,
         }),
         recordCeilingMs,
         'sandbox recording',
@@ -625,6 +808,11 @@ export class PipelineOrchestrator {
     if (!s) throw new Error(`Session ${id} not found`);
     return s;
   }
+}
+
+/** Identity of a script's text, used to decide whether its audio can be reused. */
+function hashScript(script: string): string {
+  return createHash('sha256').update(script.trim()).digest('hex');
 }
 
 /** Reject if `promise` does not settle within `ms`. Used to bound the recorder. */

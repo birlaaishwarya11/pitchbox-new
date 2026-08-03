@@ -91,6 +91,14 @@ async function main(): Promise<void> {
         appStartCommand: z.string().optional().describe('Command that starts the app in the sandbox, e.g. "npm run dev".'),
         appBuildCommand: z.string().optional().describe('Build command to run before starting the app.'),
         sandboxPort: z.number().optional().describe('Port the app listens on inside the sandbox.'),
+        appEnv: z
+          .record(z.string(), z.string())
+          .optional()
+          .describe(
+            'Environment variables the repo needs to boot, e.g. { DATABASE_URL: "…" }. Most projects will not ' +
+              'start without them, and an app that never starts cannot be recorded. Sent per-run and never stored. ' +
+              'Max 40 variables, 16KB total; PORT and HOST are set by the recorder and cannot be overridden.',
+          ),
       },
     },
     async (args) => {

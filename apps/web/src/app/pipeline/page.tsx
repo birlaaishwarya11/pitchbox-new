@@ -115,6 +115,8 @@ export default function PipelinePage() {
   const [recordUrl, setRecordUrl] = useState('');
   const [appStartCommand, setAppStartCommand] = useState('');
   const [sandboxPort, setSandboxPort] = useState<number | ''>('');
+  // Pasted as .env text, sent as-is; the server parses and bounds it.
+  const [appEnv, setAppEnv] = useState('');
   const [targetDurationSec, setTargetDurationSec] = useState(90);
   // Which optional stages to run. Required stages always run.
   const [selectedOptional, setSelectedOptional] = useState<Set<StageId>>(
@@ -200,6 +202,7 @@ export default function PipelinePage() {
           recordUrl: recordUrl.trim() || undefined,
           appStartCommand: appStartCommand.trim() || undefined,
           sandboxPort: typeof sandboxPort === 'number' ? sandboxPort : undefined,
+          appEnv: appEnv.trim() || undefined,
           targetDurationSec,
           selectedStages: selectedStageIds(),
           skipRecording: !recordSelected,
@@ -314,6 +317,8 @@ export default function PipelinePage() {
             appStartCommand={appStartCommand}
             setAppStartCommand={setAppStartCommand}
             sandboxPort={sandboxPort}
+            appEnv={appEnv}
+            setAppEnv={setAppEnv}
             setSandboxPort={setSandboxPort}
             targetDurationSec={targetDurationSec}
             setTargetDurationSec={setTargetDurationSec}
@@ -394,6 +399,8 @@ function InputCard(props: {
   appStartCommand: string;
   setAppStartCommand: (v: string) => void;
   sandboxPort: number | '';
+  appEnv: string;
+  setAppEnv: (v: string) => void;
   setSandboxPort: (v: number | '') => void;
   targetDurationSec: number;
   setTargetDurationSec: (v: number) => void;
@@ -482,6 +489,25 @@ function InputCard(props: {
               placeholder="port (default: 3000)"
               className="w-full rounded bg-zinc-950 border border-zinc-800 p-1.5 text-xs"
             />
+            <div className="sm:col-span-2 space-y-1.5">
+              <label className="text-xs text-zinc-400">Environment variables (optional)</label>
+              <textarea
+                value={props.appEnv}
+                onChange={(e) => props.setAppEnv(e.target.value)}
+                rows={4}
+                spellCheck={false}
+                placeholder={'DATABASE_URL=postgres://…\nNEXT_PUBLIC_API_URL=https://…'}
+                className="w-full rounded bg-zinc-950 border border-zinc-800 p-1.5 text-xs font-mono"
+              />
+              <p className="text-[10px] text-zinc-500">
+                Paste your <span className="font-mono">.env</span> — most projects will not boot without one, and an app
+                that never starts cannot be recorded. Written to{' '}
+                <span className="font-mono">.env.local</span> in the sandbox and passed to the build and start commands.
+                Sent per-run, never stored, never logged, and never shown in a response. Max 40 variables, 16&nbsp;KB
+                total. <span className="font-mono">PORT</span> and <span className="font-mono">HOST</span> are set for
+                you.
+              </p>
+            </div>
             <p className="text-[10px] text-zinc-500 sm:col-span-2">
               The repo is built &amp; run inside an isolated Daytona sandbox, then recorded. Set the dev command + port your app listens on.
             </p>
