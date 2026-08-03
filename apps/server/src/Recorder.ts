@@ -1271,7 +1271,12 @@ export class Recorder {
     if (beat.action === 'type') {
       const value = identity ? resolveTokens(beat.value ?? '', identity) : (beat.value ?? '');
       if (!value) return;
-      await this.pointAndClick(page, beat.selector, gate);
+      // Select whatever is in the field first, so typing replaces rather than
+      // appends. `keyboard.type` only ever appends, and a field that already had
+      // content — a re-fill, a browser autofill, a value the app pre-populated —
+      // ended up holding both. A password typed into twice is not a password,
+      // and the resulting login failure looks nothing like its cause.
+      await this.pointAndClick(page, beat.selector, gate, 3);
       // Typed rather than assigned: a controlled React input ignores a value
       // set on the element, and the viewer should see the characters appear.
       await page.keyboard.type(value, { delay: TYPE_DELAY_MS });
@@ -1295,15 +1300,20 @@ export class Recorder {
    * disagree, and Puppeteer's selector click scrolls the element into view,
    * which would yank the page out from under the camera mid-shot.
    */
-  private async pointAndClick(page: Page, selector: string, gate: CaptureGate): Promise<void> {
+  private async pointAndClick(
+    page: Page,
+    selector: string,
+    gate: CaptureGate,
+    clickCount = 1,
+  ): Promise<void> {
     const point = await page.evaluate(moveCursorTo, selector).catch(() => null);
     if (!point) {
-      await gate.input(() => page.click(selector, { delay: 40 })).catch(() => undefined);
+      await gate.input(() => page.click(selector, { clickCount, delay: 40 })).catch(() => undefined);
       return;
     }
     await this.delay(CURSOR_GLIDE_MS);
     await page.evaluate(cursorPulse).catch(() => undefined);
-    await gate.input(() => page.mouse.click(point.x, point.y, { delay: 40 }));
+    await gate.input(() => page.mouse.click(point.x, point.y, { clickCount, delay: 40 }));
   }
 
   /**
