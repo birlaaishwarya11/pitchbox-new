@@ -9,7 +9,7 @@ import {
   moveCursorTo,
   cursorPulse,
 } from './cinematics/pageScript';
-import type { Beat } from './cinematics/types';
+import type { Beat, SerializedCookie } from './cinematics/types';
 import { resolveTokens, type DummyIdentity } from './cinematics/dummyIdentity';
 import { mkdtemp, mkdir, rename, rm, access, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -420,6 +420,16 @@ export class Recorder {
       beats?: Beat[];
       /** Persona substituted into `{{token}}` values as they are typed. */
       identity?: DummyIdentity;
+      /**
+       * A session to open with, captured by the scout after it authenticated.
+       *
+       * Set these and the take begins inside the product instead of performing a
+       * login on camera. That login was the single most fragile thing in the
+       * pipeline — it depended on the form submitting, the redirect landing and
+       * the account existing, and each of those failed at least once — while the
+       * session that already worked is just a handful of cookies.
+       */
+      authCookies?: SerializedCookie[];
     } = {},
   ): Promise<RecordingResult> {
     const url = this.normalizeUrl(rawUrl);
@@ -431,7 +441,14 @@ export class Recorder {
 
     try {
       if (mode === 'xvfb') {
-        await this.recordWithXvfb(url, tmpOutput, options.targetDurationMs, options.beats, options.identity);
+        await this.recordWithXvfb(
+          url,
+          tmpOutput,
+          options.targetDurationMs,
+          options.beats,
+          options.identity,
+          options.authCookies,
+        );
       } else {
         await this.recordWithScreenshots(
           url,
@@ -439,6 +456,7 @@ export class Recorder {
           options.targetDurationMs,
           options.beats,
           options.identity,
+          options.authCookies,
         );
       }
 
@@ -491,6 +509,7 @@ export class Recorder {
     targetDurationMs?: number,
     beats?: Beat[],
     identity?: DummyIdentity,
+    authCookies?: SerializedCookie[],
   ): Promise<void> {
     let virtualDisplay: VirtualDisplaySession | undefined;
     let ffmpegProcess: ChildProcessWithoutNullStreams | undefined;
@@ -505,6 +524,7 @@ export class Recorder {
 
       browser = await this.launchBrowserHeaded(ffmpegDisplay);
       const page = await browser.newPage();
+      await this.applyAuthCookies(page, authCookies);
       await this.preparePage(page, url);
 
       const walkthrough = beats ?? [];
@@ -567,6 +587,7 @@ export class Recorder {
     targetDurationMs?: number,
     beats?: Beat[],
     identity?: DummyIdentity,
+    authCookies?: SerializedCookie[],
   ): Promise<void> {
     let ffmpegProcess: ChildProcessWithoutNullStreams | undefined;
     let browser: Browser | undefined;
@@ -590,6 +611,7 @@ export class Recorder {
       browser = await this.launchBrowserHeadless();
       const page = await browser.newPage();
       await page.setViewport({ width: this.viewport.width, height: this.viewport.height });
+      await this.applyAuthCookies(page, authCookies);
       await this.preparePage(page, url);
 
       // Install the camera before any frame is captured, so beat 0 is already
@@ -1169,6 +1191,24 @@ export class Recorder {
     };
 
     return puppeteer.launch(launchOptions);
+  }
+
+  /**
+   * Open the page already signed in, when the scout handed us a session.
+   *
+   * Set before the first navigation so the very first request carries them —
+   * applying them afterwards would mean the landing page loads logged out and
+   * then flickers, which is worse on camera than either state alone.
+   */
+  private async applyAuthCookies(page: Page, cookies?: SerializedCookie[]): Promise<void> {
+    if (!cookies?.length) return;
+    try {
+      await page.setCookie(...cookies);
+      console.log(`[recorder] opened with ${cookies.length} cookie(s) from the scout's session`);
+    } catch (err) {
+      // Not fatal: the walkthrough can still sign in the slow way.
+      console.warn('[recorder] could not restore the scout session:', describeError(err));
+    }
   }
 
   private async preparePage(page: Page, url: string): Promise<void> {

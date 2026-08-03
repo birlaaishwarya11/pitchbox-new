@@ -100,6 +100,28 @@ export interface SiteMap {
    * persona lands on "Invalid login credentials" in the finished video.
    */
   authUsed?: 'registered' | 'signed-in';
+  /**
+   * The scout's cookies once it was authenticated.
+   *
+   * Handed to the recorder so the take starts already signed in. Performing the
+   * login again on camera is the fragile path — it depends on the form
+   * submitting, the redirect landing, and the account matching — and every one of
+   * those failed at least once. Reusing the session that already worked skips all
+   * of it, and a demo that opens inside the product is a better demo anyway.
+   */
+  authCookies?: SerializedCookie[];
+}
+
+/** A cookie as Puppeteer both reports and accepts it. */
+export interface SerializedCookie {
+  name: string;
+  value: string;
+  domain?: string;
+  path?: string;
+  expires?: number;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: 'Strict' | 'Lax' | 'None';
 }
 
 /**

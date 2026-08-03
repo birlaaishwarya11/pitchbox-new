@@ -9,7 +9,7 @@ import {
   harvestNavButtons,
   harvestTargets,
 } from './cinematics/pageScript';
-import type { FormTarget, LinkTarget, ScreenSnapshot, SiteMap } from './cinematics/types';
+import type { FormTarget, LinkTarget, ScreenSnapshot, SerializedCookie, SiteMap } from './cinematics/types';
 import { valueForField, type DummyIdentity } from './cinematics/dummyIdentity';
 
 /**
@@ -119,11 +119,12 @@ export class SiteScout {
     let browser: Browser | undefined;
     let appError: string | undefined;
     let authUsed: 'registered' | 'signed-in' | undefined;
+    let authCookies: SerializedCookie[] | undefined;
     const finish = (): SiteMap => {
       if (screens.length >= this.maxScreens) {
         notes.push(`Exploration stopped at the ${this.maxScreens}-screen cap.`);
       }
-      return { origin: entry.origin, entryUrl: entry.toString(), screens, notes, appError, authUsed };
+      return { origin: entry.origin, entryUrl: entry.toString(), screens, notes, appError, authUsed, authCookies };
     };
 
     const run = async (): Promise<void> => {
@@ -196,7 +197,27 @@ export class SiteScout {
         const record = (how: 'registered' | 'signed-in') => {
           authUsed = how;
         };
-        for (const screen of await this.visitRoute(page, next, entry, identity, deadline, notes, record)) {
+        const captureSession = async (fromPage: Page) => {
+          // Taken at the moment authentication succeeded, while the session is
+          // certainly valid, rather than at the end of exploring — by then the
+          // scout may have wandered somewhere that cleared it.
+          authCookies = (await fromPage.cookies().catch(() => [])) as SerializedCookie[];
+          if (authCookies.length) {
+            console.log(`[scout] captured ${authCookies.length} cookie(s) so the take can start signed in`);
+          }
+        };
+        for (const screen of await this.visitRoute(
+          page,
+          next,
+          entry,
+          identity,
+          deadline,
+          notes,
+          async (how) => {
+            record(how);
+            await captureSession(page);
+          },
+        )) {
           if (visitedPaths.has(screen.path)) continue;
           if (screens.length >= this.maxScreens) break;
           screens.push(screen);
@@ -387,7 +408,7 @@ export class SiteScout {
     identity: DummyIdentity,
     deadline: number,
     notes: string[],
-    onAuth?: (how: 'registered' | 'signed-in') => void,
+    onAuth?: (how: 'registered' | 'signed-in') => void | Promise<void>,
   ): Promise<ScreenSnapshot[]> {
     const from = new URL(page.url()).pathname;
     try {
@@ -510,7 +531,7 @@ export class SiteScout {
     entry: URL,
     identity: DummyIdentity,
     notes: string[],
-    onAuth?: (how: 'registered' | 'signed-in') => void,
+    onAuth?: (how: 'registered' | 'signed-in') => void | Promise<void>,
   ): Promise<ScreenSnapshot[]> {
     const before = page.url();
 
@@ -578,7 +599,7 @@ export class SiteScout {
         notes.push('This persona already has an account here, so signing in instead.');
         const signedIn = await this.signInHere(page, entry, identity, notes);
         if (signedIn) {
-          onAuth?.('signed-in');
+          await onAuth?.('signed-in');
           return [signedIn];
         }
       }
@@ -598,7 +619,7 @@ export class SiteScout {
     }
 
     notes.push(`Registered and reached ${landed.path}.`);
-    onAuth?.('registered');
+    await onAuth?.('registered');
     return [landed];
   }
 

@@ -138,6 +138,16 @@ export class Director {
         `# Voiceover script (timing reference)`,
         input.script.trim(),
         ``,
+        ...(input.siteMap.authCookies?.length
+          ? [
+              `# ALREADY SIGNED IN`,
+              `The recording opens with the demo account's session already restored, so the product is`,
+              `open and authenticated from the first frame. Do NOT plan a sign-in, a signup, or any`,
+              `visit to a login screen — there is nothing to log into and it would waste the runtime.`,
+              `Start inside the product.`,
+              ``,
+            ]
+          : []),
         ...(input.flowPlan
           ? [
               `# THE APPROVED WALKTHROUGH — follow this`,

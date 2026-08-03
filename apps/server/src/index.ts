@@ -196,7 +196,16 @@ function getOwnedSession(req: Request, res: Response) {
   const authed = req as AuthedRequest;
   const session = sessionStore.get(req.params.id);
   if (!session || session.userId !== authed.user?.id) {
-    res.status(404).json({ error: 'Session not found', code: 'SESSION_NOT_FOUND' });
+    // Deliberately the same answer whether it never existed or is not yours —
+    // see above. The added sentence is true in both cases and leaks nothing,
+    // and it names the cause people actually hit: sessions live in memory, so a
+    // server restart takes them with it.
+    res.status(404).json({
+      error:
+        'Session not found. Sessions are held in memory, so they are lost if the server restarts, ' +
+        'and they expire after two hours. Start a new run.',
+      code: 'SESSION_NOT_FOUND',
+    });
     return null;
   }
   return session;

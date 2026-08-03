@@ -10,7 +10,7 @@ import { Director } from './Director';
 import { FlowPlanner } from './FlowPlanner';
 import type { SiteScout } from './SiteScout';
 import { makeDummyIdentity, type DummyIdentity } from './cinematics/dummyIdentity';
-import type { Beat, SiteMap } from './cinematics/types';
+import type { Beat, SerializedCookie, SiteMap } from './cinematics/types';
 import { createLlmClient, type LlmConfig } from './llm/createLlmClient';
 import type { LlmClient } from './llm/LlmClient';
 import { AudioGenerator } from './AudioGenerator';
@@ -108,6 +108,8 @@ export interface PipelineDeps {
 interface PlannedWalkthrough {
   beats: Beat[];
   identity: DummyIdentity;
+  /** The scout's session, so the take opens inside the product. */
+  authCookies?: SerializedCookie[];
 }
 
 export interface StartInput {
@@ -851,7 +853,7 @@ export class PipelineOrchestrator {
         `[pipeline ${session.id}] directed ${walkthrough.beats.length} beats (${actions} interactions)`,
       );
 
-      return { beats: walkthrough.beats, identity: takeIdentity };
+      return { beats: walkthrough.beats, identity: takeIdentity, authCookies: siteMap.authCookies };
     } catch (err) {
       console.warn(
         `[pipeline ${session.id}] walkthrough planning failed, the recording will scroll instead:`,
@@ -872,7 +874,7 @@ export class PipelineOrchestrator {
         session.scriptVersions.find((v) => v.id === session.approvedVersionId) ??
         session.scriptVersions[session.scriptVersions.length - 1];
 
-      const { beats, identity } = await this.planWalkthrough(
+      const { beats, identity, authCookies } = await this.planWalkthrough(
         session,
         session.input.recordUrl,
         approved?.fullScript,
@@ -891,6 +893,7 @@ export class PipelineOrchestrator {
           // video, not a broken one.
           beats,
           identity,
+          authCookies,
         }),
         recordCeilingMs,
         'URL recording',
