@@ -9,7 +9,7 @@ import {
   harvestNavButtons,
   harvestTargets,
 } from './cinematics/pageScript';
-import type { FormTarget, LinkTarget, ScreenSnapshot, SerializedCookie, SiteMap } from './cinematics/types';
+import type { FormTarget, LinkTarget, ScreenSnapshot, SiteMap } from './cinematics/types';
 import { valueForField, type DummyIdentity } from './cinematics/dummyIdentity';
 
 /**
@@ -129,13 +129,11 @@ export class SiteScout {
 
     let browser: Browser | undefined;
     let appError: string | undefined;
-    let authUsed: 'registered' | 'signed-in' | undefined;
-    let authCookies: SerializedCookie[] | undefined;
     const finish = (): SiteMap => {
       if (screens.length >= this.maxScreens) {
         notes.push(`Exploration stopped at the ${this.maxScreens}-screen cap.`);
       }
-      return { origin: entry.origin, entryUrl: entry.toString(), screens, notes, appError, authUsed, authCookies };
+      return { origin: entry.origin, entryUrl: entry.toString(), screens, notes, appError };
     };
 
     const run = async (): Promise<void> => {
@@ -179,15 +177,13 @@ export class SiteScout {
         return;
       }
 
-      // 1. Get inside the product first. Everything interesting usually lives
-      //    behind the signup, and the routes discovered there are better demo
-      //    material than the marketing footer links.
-      const authScreens = await this.attemptAuth(page, entry, identity, deadline, notes);
-      for (const screen of authScreens) {
-        if (screens.length >= this.maxScreens) break;
-        if (visitedPaths.has(screen.path)) continue;
-        screens.push(screen);
-        visitedPaths.add(screen.path);
+      // Nothing here signs in. That is the caller's job, done by hand in a
+      // browser they drive, and this explores whatever it left them looking at.
+      if (looksLikeLoginWall(landing)) {
+        notes.push(
+          'The entry page is a sign-in screen. Sign in yourself in the browser Pitchbox offers and the ' +
+            'walkthrough will cover the product behind it.',
+        );
       }
 
       // 2. Then spread out across whatever the current screen links to. Links
@@ -209,30 +205,7 @@ export class SiteScout {
         triedSelectors.add(next.selector);
         // A button route's destination is unknowable until it is taken, so
         // the duplicate check has to happen here rather than when choosing it.
-        const record = (how: 'registered' | 'signed-in') => {
-          authUsed = how;
-        };
-        const captureSession = async (fromPage: Page) => {
-          // Taken at the moment authentication succeeded, while the session is
-          // certainly valid, rather than at the end of exploring — by then the
-          // scout may have wandered somewhere that cleared it.
-          authCookies = (await fromPage.cookies().catch(() => [])) as SerializedCookie[];
-          if (authCookies.length) {
-            console.log(`[scout] captured ${authCookies.length} cookie(s) so the take can start signed in`);
-          }
-        };
-        for (const screen of await this.visitRoute(
-          page,
-          next,
-          entry,
-          identity,
-          deadline,
-          notes,
-          async (how) => {
-            record(how);
-            await captureSession(page);
-          },
-        )) {
+        for (const screen of await this.visitRoute(page, next, entry, identity, deadline, notes)) {
           if (visitedPaths.has(screen.path)) continue;
           if (screens.length >= this.maxScreens) break;
           screens.push(screen);
@@ -277,90 +250,6 @@ export class SiteScout {
   // Steps
   // -------------------------------------------------------------------------
 
-  /**
-   * Try to get past the front door, preferring signup over signin.
-   *
-   * Signup is tried first because it works on an app nobody has an account for,
-   * which is the situation every demo run is in.
-   */
-  private async attemptAuth(
-    page: Page,
-    entry: URL,
-    identity: DummyIdentity,
-    deadline: number,
-    notes: string[],
-  ): Promise<ScreenSnapshot[]> {
-    const out: ScreenSnapshot[] = [];
-    if (Date.now() >= deadline) return out;
-
-    const door = await this.findAuthEntry(page, entry);
-    if (!door) {
-      notes.push('No signup or signin entry point was found; the walkthrough stays on public pages.');
-      return out;
-    }
-
-    try {
-      await this.follow(page, door.selector, door.href, entry);
-    } catch (err) {
-      notes.push(`Could not open the ${door.kind} screen: ${describe(err)}`);
-      return out;
-    }
-
-    const authScreen = await this.harvest(
-      page,
-      `clicking ${JSON.stringify(door.selector)} ("${door.text}") on the landing page — the ${door.kind} screen`,
-    );
-    out.push(authScreen);
-
-    const form = pickFillableForm(authScreen.forms);
-    if (!form) {
-      notes.push(`The ${door.kind} screen had no fillable form.`);
-      return out;
-    }
-    if (Date.now() >= deadline) return out;
-
-    try {
-      await this.fillForm(page, form, identity);
-      const submitted = await this.submitForm(page, form);
-      if (!submitted) {
-        notes.push(`Filled the ${door.kind} form but found no safe submit control.`);
-        return out;
-      }
-      await this.settle(page, 2_500);
-      const landed = await this.harvest(
-        page,
-        `submitting the ${door.kind} form with ${JSON.stringify(form.submitSelector ?? '')}`,
-      );
-      // Still staring at the same form means it was rejected — a validation
-      // error, an email that already exists, a captcha. Worth saying so.
-      if (landed.path === authScreen.path && pickFillableForm(landed.forms)) {
-        // Read the app's own complaint where it gives one: the two common causes
-        // are a rejected address and a confirmation step, and they need different
-        // fixes from whoever is running this.
-        const shown = await page
-          .evaluate(() => (document.body?.innerText ?? '').replace(/\s+/g, ' ').slice(0, 400))
-          .catch(() => '');
-        const emailRejected = /e-?mail[^.]{0,40}(invalid|not valid|not allowed|unsupported)/i.test(shown);
-        const needsConfirm = /(confirm|verify)[^.]{0,30}(e-?mail|inbox)|check your (e-?mail|inbox)/i.test(shown);
-
-        notes.push(
-          `The ${door.kind} form did not go through (still on ${landed.path}).` +
-            (emailRejected
-              ? ' The app rejected the dummy email address. example.com is reserved and many' +
-                ' validators refuse it — set PITCHBOX_DEMO_EMAIL_DOMAIN to a domain you control.'
-              : needsConfirm
-                ? ' The app requires email confirmation, so the walkthrough cannot get past the login.'
-                : ' The app may require email confirmation, a captcha, or an invite.') +
-            (shown ? ` It said: ${shown.slice(0, 160)}` : ''),
-        );
-      }
-      out.push(landed);
-    } catch (err) {
-      notes.push(`The ${door.kind} flow failed: ${describe(err)}`);
-    }
-
-    return out;
-  }
 
   /** The most promising route not yet taken, preferring real links. */
   private async nextRoute(
@@ -425,7 +314,6 @@ export class SiteScout {
     identity: DummyIdentity,
     deadline: number,
     notes: string[],
-    onAuth?: (how: 'registered' | 'signed-in') => void | Promise<void>,
   ): Promise<ScreenSnapshot[]> {
     const from = new URL(page.url()).pathname;
     try {
@@ -449,24 +337,15 @@ export class SiteScout {
     const form = pickFillableForm(screen.forms);
     if (!form || Date.now() >= deadline) return [screen];
 
-    // Fill it, but never submit a credential form from here.
-    //
-    // A form with a password field is a sign-in, and a dummy persona has no
-    // account to sign in with — submitting it cannot succeed by construction, it
-    // can only produce "Invalid login credentials". That error then became the
-    // screen the director framed, and a showcase video ended on a red failure
-    // box. Signing up is `attemptAuth`'s job: it knows to prefer registration
-    // over authentication and reports why when it is refused.
-    const isCredentialForm = form.fields.some((f) => f.kind === 'password');
+    // A password field means this is a sign-in, and it is left completely alone
+    // — not filled, not submitted. Pitchbox has no business typing credentials,
+    // and the person who has them signs in themselves.
+    if (form.fields.some((f) => f.kind === 'password')) {
+      notes.push(`Left the sign-in form on ${screen.path} alone; sign in yourself to reach what is behind it.`);
+      return [screen];
+    }
+
     try {
-      if (isCredentialForm) {
-        // A credential form must be registered against, not signed into. Most
-        // apps put both on one screen behind a "Sign up" toggle rather than at a
-        // separate URL, which is why looking only at the landing page for a
-        // signup entry point found nothing and left the product locked.
-        const registered = await this.registerHere(page, entry, identity, notes, onAuth);
-        return registered.length ? [screen, ...registered] : [screen];
-      }
       await this.fillForm(page, form, identity);
       if (!(await this.submitForm(page, form))) return [screen];
       await this.settle(page, 2_000);
@@ -535,172 +414,7 @@ export class SiteScout {
     await this.settle(page);
   }
 
-/**
-   * Register on the screen we are already looking at.
-   *
-   * Signing in cannot work — the persona has no account — so the only way past a
-   * credential form is to create one. Apps overwhelmingly put sign-in and sign-up
-   * on the same screen behind a toggle, so the toggle is clicked first when there
-   * is one, and only then is the form filled and submitted.
-   */
-  private async registerHere(
-    page: Page,
-    entry: URL,
-    identity: DummyIdentity,
-    notes: string[],
-    onAuth?: (how: 'registered' | 'signed-in') => void | Promise<void>,
-  ): Promise<ScreenSnapshot[]> {
-    const before = page.url();
 
-    // Switch the form into signup mode if the screen offers that.
-    try {
-      const candidates: RouteCandidate[] = [
-        ...(await page.evaluate(harvestNavButtons).catch(() => [])),
-        ...(await page.evaluate(harvestLinks).catch(() => [])),
-      ];
-      const toggle = candidates.find((c) => SIGNUP_TEXT.test(c.text) && !OAUTH_TEXT.test(c.text));
-      if (toggle) {
-        await page.click(toggle.selector, { delay: 20 }).catch(() => undefined);
-        await this.settle(page, 900);
-        if (!this.isSameOrigin(page.url(), entry)) {
-          await page.goto(before, { waitUntil: 'domcontentloaded', timeout: this.navigationTimeoutMs }).catch(() => undefined);
-          notes.push('The signup control led off-site, so registration was abandoned.');
-          return [];
-        }
-      } else {
-        notes.push('No signup toggle was found on the credential screen; trying the form as it stands.');
-      }
-    } catch {
-      /* the form as it stands is still worth a try */
-    }
-
-    // Re-harvest: switching mode usually adds or relabels fields.
-    const screen = await this.harvest(page, 'the signup form');
-    const form = pickFillableForm(screen.forms);
-    if (!form) {
-      notes.push('The signup screen had no fillable form.');
-      return [];
-    }
-
-    await this.fillForm(page, form, identity);
-    if (!(await this.submitForm(page, form))) {
-      notes.push('Filled the signup form but found no safe submit control.');
-      return [];
-    }
-    await this.settle(page, 3_000);
-
-    const landed = await this.harvest(page, `submitting the signup form with ${JSON.stringify(form.submitSelector ?? '')}`);
-
-    // Refused means "still on the same screen, still asking for credentials".
-    //
-    // The path comparison is load-bearing. Testing only for a lingering password
-    // field declared a *successful* signup a failure on the first app this was
-    // pointed at, because the page it landed on has an API-key input — which is
-    // `type="password"` like any other secret field. Signing in and being handed
-    // a form that wants a different secret are not the same thing.
-    const stillOnAuthScreen = landed.path === screen.path;
-    if (stillOnAuthScreen && pickFillableForm(landed.forms)?.fields.some((f) => f.kind === 'password')) {
-      const shown = await page
-        .evaluate(() => (document.body?.innerText ?? '').replace(/\s+/g, ' ').slice(0, 400))
-        .catch(() => '');
-      const emailRejected = /e-?mail[^.]{0,40}(invalid|not valid|not allowed|unsupported)/i.test(shown);
-      const needsConfirm = /(confirm|verify)[^.]{0,30}(e-?mail|inbox)|check your (e-?mail|inbox)/i.test(shown);
-      const alreadyExists = /already (registered|exists|in use|taken)|account already|user already/i.test(shown);
-
-      // The persona is deterministic so that a retry reuses the account it made
-      // rather than orphaning a new one. The flip side is that every run after
-      // the first is told the user already exists — at which point the obvious
-      // move is the one a person would make: sign in with the credentials we
-      // know, because we are the ones who created them.
-      if (alreadyExists) {
-        notes.push('This persona already has an account here, so signing in instead.');
-        const signedIn = await this.signInHere(page, entry, identity, notes);
-        if (signedIn) {
-          await onAuth?.('signed-in');
-          return [signedIn];
-        }
-      }
-
-      notes.push(
-        'Signup was refused.' +
-          (emailRejected
-            ? ' The dummy email address was rejected — set PITCHBOX_DEMO_EMAIL_DOMAIN to a domain you control.'
-            : needsConfirm
-              ? ' The app requires email confirmation, so the walkthrough cannot get past the login.'
-              : alreadyExists
-                ? ' The persona already has an account and signing in did not work either.'
-                : ' It may require a captcha or an invite.') +
-          (shown ? ` It said: ${shown.slice(0, 160)}` : ''),
-      );
-      return [];
-    }
-
-    notes.push(`Registered and reached ${landed.path}.`);
-    await onAuth?.('registered');
-    return [landed];
-  }
-
-/**
-   * Sign in on the current screen with the persona's own credentials.
-   *
-   * Only reached after an app reports the account already exists, which means
-   * this persona created it on an earlier run. This is the one case where
-   * submitting a credential form can succeed, so it is the one case where it is
-   * allowed to.
-   */
-  private async signInHere(
-    page: Page,
-    entry: URL,
-    identity: DummyIdentity,
-    notes: string[],
-  ): Promise<ScreenSnapshot | null> {
-    const before = new URL(page.url()).pathname;
-
-    // Flip back to sign-in mode if the screen is a toggle.
-    try {
-      const candidates: RouteCandidate[] = [
-        ...(await page.evaluate(harvestNavButtons).catch(() => [])),
-        ...(await page.evaluate(harvestLinks).catch(() => [])),
-      ];
-      const toggle = candidates.find((c) => SIGNIN_TEXT.test(c.text) && !OAUTH_TEXT.test(c.text));
-      if (toggle) {
-        await page.click(toggle.selector, { delay: 20 }).catch(() => undefined);
-        await this.settle(page, 900);
-        if (!this.isSameOrigin(page.url(), entry)) return null;
-      }
-    } catch {
-      /* the form as it stands may already be a sign-in */
-    }
-
-    const screen = await this.harvest(page, 'the sign-in form');
-    const form = pickFillableForm(screen.forms);
-    if (!form) return null;
-
-    await this.fillForm(page, form, identity);
-    if (!(await this.submitForm(page, form))) return null;
-    // Longer than a plain form post: this is a network round-trip to the auth
-    // provider followed by a client-side redirect.
-    await this.settle(page, 5_000);
-
-    const landed = await this.harvest(page, 'signing in with the persona that was registered earlier');
-    // Compare pathnames, not paths. `ScreenSnapshot.path` carries the query
-    // string, so measuring it against a bare pathname made
-    // `/login?redirect=%2Fpipeline` look like progress away from `/login` and
-    // reported a sign-in that had not happened.
-    const landedPath = (() => {
-      try {
-        return new URL(landed.url).pathname;
-      } catch {
-        return landed.path;
-      }
-    })();
-    if (landedPath === before) {
-      notes.push('Signing in did not move off the login screen either.');
-      return null;
-    }
-    notes.push(`Signed in and reached ${landedPath}.`);
-    return landed;
-  }
 
   /** True when `candidate` is on the origin the caller authorised. */
   private isSameOrigin(candidate: string, entry: URL): boolean {
@@ -836,58 +550,11 @@ export class SiteScout {
     }
   }
 
-  /**
-   * Find the way in: a signup entry point, or a signin one if that is all there
-   * is.
-   *
-   * Buttons are considered alongside links. An app that routes through onClick
-   * has no anchor to match on, and looking only at anchors declared every such
-   * product to be a single marketing page with nothing behind it.
-   */
-  private async findAuthEntry(
-    page: Page,
-    entry: URL,
-  ): Promise<{ selector: string; text: string; href?: string; kind: 'signup' | 'signin' } | null> {
-    const candidates: RouteCandidate[] = [];
+}
 
-    try {
-      const links = await page.evaluate(harvestLinks);
-      for (const link of links) {
-        try {
-          if (new URL(link.href).origin === entry.origin) candidates.push(link);
-        } catch {
-          /* skip an unparseable href */
-        }
-      }
-    } catch {
-      /* fall through to buttons */
-    }
-
-    try {
-      candidates.push(...(await page.evaluate(harvestNavButtons)));
-    } catch {
-      /* buttons are a bonus, not a requirement */
-    }
-
-    const match = (pattern: RegExp): RouteCandidate | undefined =>
-      candidates.find((c) => {
-        // "Sign in with Google" matches SIGNIN_TEXT but is a door out of the app.
-        if (OAUTH_TEXT.test(c.text)) return false;
-        if (pattern.test(c.text)) return true;
-        if (!c.href) return false;
-        try {
-          return pattern.test(new URL(c.href).pathname);
-        } catch {
-          return false;
-        }
-      });
-
-    const signup = match(SIGNUP_TEXT);
-    if (signup) return { ...signup, kind: 'signup' };
-    const signin = match(SIGNIN_TEXT);
-    if (signin) return { ...signin, kind: 'signin' };
-    return null;
-  }
+/** True when a screen is a sign-in wall rather than the product itself. */
+function looksLikeLoginWall(screen: ScreenSnapshot | undefined): boolean {
+  return Boolean(screen?.forms.some((f) => f.fields.some((x) => x.kind === 'password')));
 }
 
 /** The form on a screen most worth filling: the one with the most real fields. */

@@ -90,38 +90,6 @@ export interface SiteMap {
    * caller is told what the app said instead.
    */
   appError?: string;
-  /**
-   * How the scout got past the front door, when it did.
-   *
-   * This decides which persona the take may use. Scouting and recording use
-   * separate personas so that a signup performed on camera does not collide with
-   * the account scouting just made — but that only holds for a signup. If the
-   * scout *signed in*, only its own account exists, and a take using the other
-   * persona lands on "Invalid login credentials" in the finished video.
-   */
-  authUsed?: 'registered' | 'signed-in';
-  /**
-   * The scout's cookies once it was authenticated.
-   *
-   * Handed to the recorder so the take starts already signed in. Performing the
-   * login again on camera is the fragile path — it depends on the form
-   * submitting, the redirect landing, and the account matching — and every one of
-   * those failed at least once. Reusing the session that already worked skips all
-   * of it, and a demo that opens inside the product is a better demo anyway.
-   */
-  authCookies?: SerializedCookie[];
-}
-
-/** A cookie as Puppeteer both reports and accepts it. */
-export interface SerializedCookie {
-  name: string;
-  value: string;
-  domain?: string;
-  path?: string;
-  expires?: number;
-  httpOnly?: boolean;
-  secure?: boolean;
-  sameSite?: 'Strict' | 'Lax' | 'None';
 }
 
 /**

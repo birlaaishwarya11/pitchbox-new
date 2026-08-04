@@ -9,7 +9,7 @@ import {
   moveCursorTo,
   cursorPulse,
 } from './cinematics/pageScript';
-import type { Beat, SerializedCookie } from './cinematics/types';
+import type { Beat } from './cinematics/types';
 import { resolveTokens, type DummyIdentity } from './cinematics/dummyIdentity';
 import { mkdtemp, mkdir, rename, rm, access, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -421,16 +421,6 @@ export class Recorder {
       /** Persona substituted into `{{token}}` values as they are typed. */
       identity?: DummyIdentity;
       /**
-       * A session to open with, captured by the scout after it authenticated.
-       *
-       * Set these and the take begins inside the product instead of performing a
-       * login on camera. That login was the single most fragile thing in the
-       * pipeline — it depended on the form submitting, the redirect landing and
-       * the account existing, and each of those failed at least once — while the
-       * session that already worked is just a handful of cookies.
-       */
-      authCookies?: SerializedCookie[];
-      /**
        * Record in a browser the caller owns rather than a fresh one.
        *
        * This is what makes a human-driven login usable: the person signs in, and
@@ -464,7 +454,6 @@ export class Recorder {
           options.targetDurationMs,
           options.beats,
           options.identity,
-          options.authCookies,
           options.browser,
           options.display,
         );
@@ -475,7 +464,6 @@ export class Recorder {
           options.targetDurationMs,
           options.beats,
           options.identity,
-          options.authCookies,
           options.browser,
         );
       }
@@ -529,7 +517,6 @@ export class Recorder {
     targetDurationMs?: number,
     beats?: Beat[],
     identity?: DummyIdentity,
-    authCookies?: SerializedCookie[],
     existingBrowser?: Browser,
     existingDisplay?: string,
   ): Promise<void> {
@@ -550,7 +537,6 @@ export class Recorder {
       // used as-is rather than launched onto ours.
       browser = existingBrowser ?? (await this.launchBrowserHeaded(ffmpegDisplay));
       const page = await browser.newPage();
-      await this.applyAuthCookies(page, authCookies);
       await this.preparePage(page, url);
 
       const walkthrough = beats ?? [];
@@ -615,7 +601,6 @@ export class Recorder {
     targetDurationMs?: number,
     beats?: Beat[],
     identity?: DummyIdentity,
-    authCookies?: SerializedCookie[],
     existingBrowser?: Browser,
   ): Promise<void> {
     let ffmpegProcess: ChildProcessWithoutNullStreams | undefined;
@@ -640,7 +625,6 @@ export class Recorder {
       browser = existingBrowser ?? (await this.launchBrowserHeadless());
       const page = await browser.newPage();
       await page.setViewport({ width: this.viewport.width, height: this.viewport.height });
-      await this.applyAuthCookies(page, authCookies);
       await this.preparePage(page, url);
 
       // Install the camera before any frame is captured, so beat 0 is already
@@ -1223,24 +1207,6 @@ export class Recorder {
     };
 
     return puppeteer.launch(launchOptions);
-  }
-
-  /**
-   * Open the page already signed in, when the scout handed us a session.
-   *
-   * Set before the first navigation so the very first request carries them —
-   * applying them afterwards would mean the landing page loads logged out and
-   * then flickers, which is worse on camera than either state alone.
-   */
-  private async applyAuthCookies(page: Page, cookies?: SerializedCookie[]): Promise<void> {
-    if (!cookies?.length) return;
-    try {
-      await page.setCookie(...cookies);
-      console.log(`[recorder] opened with ${cookies.length} cookie(s) from the scout's session`);
-    } catch (err) {
-      // Not fatal: the walkthrough can still sign in the slow way.
-      console.warn('[recorder] could not restore the scout session:', describeError(err));
-    }
   }
 
   private async preparePage(page: Page, url: string): Promise<void> {

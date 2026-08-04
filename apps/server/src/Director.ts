@@ -117,6 +117,14 @@ export interface DirectorInput {
    * human, so it outranks anything this agent would have chosen for itself.
    */
   flowPlan?: string;
+  /**
+   * The recording opens inside the product because a human already signed in.
+   *
+   * Set by the caller rather than inferred: the sign-in happened in a browser
+   * Pitchbox was handed, not one it drove, so there is nothing in the site map
+   * that would reveal it.
+   */
+  alreadySignedIn?: boolean;
 }
 
 export class Director {
@@ -138,7 +146,7 @@ export class Director {
         `# Voiceover script (timing reference)`,
         input.script.trim(),
         ``,
-        ...(input.siteMap.authCookies?.length
+        ...(input.alreadySignedIn
           ? [
               `# ALREADY SIGNED IN`,
               `The recording opens with the demo account's session already restored, so the product is`,

@@ -121,7 +121,6 @@ export class FlowPlanner {
 /** Compact description of what is reachable, for the planner to reason over. */
 function describeScreens(siteMap: SiteMap): string {
   const lines: string[] = [`Entry: ${siteMap.entryUrl}`];
-  if (siteMap.authUsed) lines.push(`The demo account is already ${siteMap.authUsed === 'signed-in' ? 'signed in' : 'registered'}.`);
   if (siteMap.notes.length) lines.push(`Notes from exploring: ${siteMap.notes.join(' | ')}`);
 
   for (const screen of siteMap.screens) {
