@@ -4,9 +4,19 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 export interface FuseInput {
-  audioPath: string;
+  /**
+   * The narration. Optional: a run with no voiceover still has a demo worth
+   * keeping, and a narration that failed to generate should not take the
+   * recording down with it.
+   */
+  audioPath?: string;
   videoPath?: string;
   outputDir: string;
+  /**
+   * How long a silent slate should last. Ignored when there is audio (the
+   * narration sets the length) or a recording (the capture does).
+   */
+  fallbackDurationMs?: number;
   // Optional title text rendered onto the slate when no video is provided.
   slateTitle?: string;
   // Optional pre-rendered slate image (PNG). When provided, it is looped as the
@@ -44,8 +54,12 @@ export class Fuser {
   async fuse(input: FuseInput): Promise<FuseResult> {
     await mkdir(input.outputDir, { recursive: true });
 
-    const audioStat = await safeStat(input.audioPath);
-    if (!audioStat) throw new FuserError(`Audio file missing: ${input.audioPath}`);
+    // A path that was given but does not exist is a bug worth reporting. No path
+    // at all is a deliberate silent run.
+    if (input.audioPath && !(await safeStat(input.audioPath))) {
+      throw new FuserError(`Audio file missing: ${input.audioPath}`);
+    }
+    const audioPath = input.audioPath;
 
     const fileName = `${randomUUID()}.mp4`;
     const filePath = path.join(input.outputDir, fileName);
@@ -53,7 +67,7 @@ export class Fuser {
     if (input.videoPath) {
       const videoStat = await safeStat(input.videoPath);
       if (!videoStat) throw new FuserError(`Video file missing: ${input.videoPath}`);
-      await runMux(input.videoPath, input.audioPath, filePath);
+      await runMux(input.videoPath, audioPath, filePath);
       const out = await stat(filePath);
       return {
         filePath,
@@ -64,11 +78,22 @@ export class Fuser {
       };
     }
 
+    // With neither audio nor video there is nothing to derive a length from, so
+    // a silent slate needs one stated. 20s is a sane last resort.
+    const silentMs = Math.max(1_000, input.fallbackDurationMs ?? 20_000);
+
+    // Both slate builders draw their video from an endless source (a looped still,
+    // or a lavfi colour field), so the length has to be stated explicitly.
+    // `-shortest` alone was overshooting the narration by a couple of seconds and
+    // leaving dead air at the end of every slate demo.
+    const slateMs = audioPath ? await ffprobeDurationMs(audioPath) : silentMs;
+    const boundedMs = slateMs > 0 ? slateMs : silentMs;
+
     const slateImage = input.slateImagePath ? await safeStat(input.slateImagePath) : null;
     if (input.slateImagePath && slateImage) {
-      await runImageSlate(input.slateImagePath, input.audioPath, filePath);
+      await runImageSlate(input.slateImagePath, audioPath, filePath, boundedMs);
     } else {
-      await runSlate(input.audioPath, filePath, input.slateTitle ?? 'Pitchbox demo');
+      await runSlate(audioPath, filePath, input.slateTitle ?? 'Pitchbox demo', boundedMs);
     }
     const out = await stat(filePath);
     return {
@@ -81,16 +106,21 @@ export class Fuser {
   }
 }
 
-async function runImageSlate(imagePath: string, audioPath: string, outputPath: string): Promise<void> {
-  // Loop a still PNG as the video track for the length of the audio.
+async function runImageSlate(
+  imagePath: string,
+  audioPath: string | undefined,
+  outputPath: string,
+  durationMs: number,
+): Promise<void> {
+  // Loop a still PNG as the video track. A looped still has no length of its
+  // own, so `durationMs` is what stops it encoding forever.
   const args = [
     '-y',
     '-loop',
     '1',
     '-i',
     imagePath,
-    '-i',
-    audioPath,
+    ...(audioPath ? ['-i', audioPath] : []),
     '-c:v',
     'libx264',
     '-tune',
@@ -99,17 +129,22 @@ async function runImageSlate(imagePath: string, audioPath: string, outputPath: s
     'yuv420p',
     '-vf',
     'scale=1280:720',
-    '-c:a',
-    'aac',
-    '-b:a',
-    '192k',
-    '-shortest',
+    '-t',
+    (durationMs / 1000).toFixed(2),
+    ...(audioPath ? ['-c:a', 'aac', '-b:a', '192k'] : ['-an']),
     outputPath,
   ];
   await runFfmpeg(args);
 }
 
-async function runMux(videoPath: string, audioPath: string, outputPath: string): Promise<void> {
+async function runMux(videoPath: string, audioPath: string | undefined, outputPath: string): Promise<void> {
+  // No narration: the recording *is* the deliverable, so hand it over as-is.
+  // Copying rather than re-encoding keeps it lossless and near-instant.
+  if (!audioPath) {
+    await runFfmpeg(['-y', '-i', videoPath, '-map', '0:v:0', '-an', '-c:v', 'copy', outputPath]);
+    return;
+  }
+
   // The recording and the voiceover are captured independently and rarely match
   // in length. `-shortest` alone truncates to whichever is shorter, and since a
   // screen capture usually finishes before the narration does, that silently
@@ -149,9 +184,15 @@ async function runMux(videoPath: string, audioPath: string, outputPath: string):
   await runFfmpeg(args);
 }
 
-async function runSlate(audioPath: string, outputPath: string, title: string): Promise<void> {
-  // Render a 1280x720 dark slate with the title centered and the voiceover as audio.
-  // Uses lavfi color source and drawtext. Duration is derived from the audio length.
+async function runSlate(
+  audioPath: string | undefined,
+  outputPath: string,
+  title: string,
+  durationMs: number,
+): Promise<void> {
+  // Render a 1280x720 dark slate with the title centered and the voiceover as
+  // audio. The lavfi colour source is infinite, so `durationMs` is what bounds
+  // it: the narration's length when there is one, the caller's target when not.
   const safe = title.replace(/[\\:'"]/g, ' ').slice(0, 80);
   const args = [
     '-y',
@@ -159,19 +200,16 @@ async function runSlate(audioPath: string, outputPath: string, title: string): P
     'lavfi',
     '-i',
     'color=c=0x0b0b10:s=1280x720:r=30',
-    '-i',
-    audioPath,
+    ...(audioPath ? ['-i', audioPath] : []),
     '-vf',
     `drawtext=fontfile=/System/Library/Fonts/Supplemental/Arial.ttf:text='${safe}':fontcolor=white:fontsize=46:x=(w-text_w)/2:y=(h-text_h)/2`,
     '-c:v',
     'libx264',
     '-pix_fmt',
     'yuv420p',
-    '-c:a',
-    'aac',
-    '-b:a',
-    '192k',
-    '-shortest',
+    '-t',
+    (durationMs / 1000).toFixed(2),
+    ...(audioPath ? ['-c:a', 'aac', '-b:a', '192k'] : ['-an']),
     outputPath,
   ];
   try {

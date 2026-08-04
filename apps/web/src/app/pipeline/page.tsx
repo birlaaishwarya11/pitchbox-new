@@ -56,8 +56,14 @@ const STAGE_META: {
   { id: 'plan', label: 'Plan', group: 'Script', optional: false, hint: 'Decide the angle, audience, hook' },
   { id: 'research', label: 'Research', group: 'Script', optional: true, hint: 'Use-case dos & don’ts' },
   { id: 'script', label: 'Write script', group: 'Script', optional: false, hint: 'Draft the voiceover script' },
+  // These two are the human-in-the-loop gates. They were missing from this list
+  // while existing on the server, and because an unlisted stage is never sent it
+  // was created as `skipped` — so the run silently sailed past both, never asking
+  // anyone to sign in or to confirm the walkthrough.
+  { id: 'login', label: 'Sign in to the target', group: 'Generate', optional: true, hint: 'Opens a real browser for you to sign into yourself' },
+  { id: 'flow', label: 'Plan the walkthrough', group: 'Generate', optional: true, hint: 'Proposes what the demo will do, for you to edit and approve' },
   { id: 'record', label: 'Screen recording', group: 'Generate', optional: true, hint: 'Capture a live/public URL' },
-  { id: 'voiceover', label: 'Voiceover', group: 'Generate', optional: false, hint: 'ElevenLabs narration' },
+  { id: 'voiceover', label: 'Voiceover', group: 'Generate', optional: true, hint: 'ElevenLabs narration — turn off for a silent demo' },
   { id: 'fuse', label: 'Assemble video', group: 'Generate', optional: false, hint: 'Mux audio onto the capture/slate' },
 ];
 
@@ -132,7 +138,7 @@ export default function PipelinePage() {
   const [targetDurationSec, setTargetDurationSec] = useState(90);
   // Which optional stages to run. Required stages always run.
   const [selectedOptional, setSelectedOptional] = useState<Set<StageId>>(
-    () => new Set<StageId>(['research', 'record']),
+    () => new Set<StageId>(['research', 'login', 'flow', 'record', 'voiceover']),
   );
   const recordSelected = selectedOptional.has('record');
 

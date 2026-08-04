@@ -725,33 +725,17 @@ export class PipelineOrchestrator {
     // stage billed per run, and re-cutting the video after an unchanged script
     // — a new take, a retry, a reiterate that ended up back where it started —
     // would otherwise buy the identical audio a second time.
-    store.setStage(sessionId, 'voiceover', { status: 'running' });
+    const voiceoverSelected = session.stages.find((s) => s.id === 'voiceover')?.status !== 'skipped';
     const scriptHash = hashScript(approvedScript.fullScript);
-    const reusable = await this.reusableAudio(session, scriptHash, sessionDir);
 
-    let audioPath: string;
-    if (reusable) {
-      audioPath = reusable;
-      store.setStage(sessionId, 'voiceover', { status: 'done', message: 'reused — script unchanged' });
-      console.log(`[pipeline ${sessionId}] reusing the existing voiceover; the script is unchanged.`);
+    let audioPath: string | undefined;
+    if (!voiceoverSelected) {
+      store.skipStage(sessionId, 'voiceover');
+      console.log(`[pipeline ${sessionId}] voiceover deselected; assembling a silent demo.`);
     } else {
-      try {
-        const audio = await audioGenerator.generate(approvedScript.fullScript, { outputDir: sessionDir });
-        audioPath = audio.filePath;
-        store.update(sessionId, (s) => {
-          s.audio = {
-            url: `${this.deps.publicMediaPrefix}/${sessionId}/${audio.fileName}`,
-            fileName: audio.fileName,
-            bytes: audio.bytes,
-            durationEstimateMs: audio.durationEstimateMs,
-            scriptHash,
-          };
-        });
-        store.setStage(sessionId, 'voiceover', { status: 'done', message: `${Math.round(audio.bytes / 1024)} KB` });
-      } catch (err) {
-        store.setStage(sessionId, 'voiceover', { status: 'failed', message: String((err as any)?.message ?? err) });
-        throw err;
-      }
+      store.setStage(sessionId, 'voiceover', { status: 'running' });
+      const reusable = await this.reusableAudio(session, scriptHash, sessionDir);
+      audioPath = await this.narrate(sessionId, approvedScript, sessionDir, scriptHash, reusable, audioGenerator);
     }
 
     // 2. Fuse
@@ -784,6 +768,7 @@ export class PipelineOrchestrator {
       outputDir: sessionDir,
       slateTitle: session.plan?.audience ? `Pitchbox · ${session.plan.audience}` : 'Pitchbox demo',
       slateImagePath,
+      fallbackDurationMs: session.input.targetDurationSec * 1_000,
     });
     store.update(sessionId, (s) => {
       s.finalVideo = {
@@ -792,7 +777,10 @@ export class PipelineOrchestrator {
       };
       s.status = 'READY';
     });
-    store.setStage(sessionId, 'fuse', { status: 'done', message: video ? 'with screen capture' : 'slate' });
+    store.setStage(sessionId, 'fuse', {
+      status: 'done',
+      message: `${video ? 'with screen capture' : 'slate'}${audioPath ? '' : ', no narration'}`,
+    });
 
     const finished = store.get(sessionId);
     const usage = this.agentsBySession.get(sessionId)?.llmClient.usage;
@@ -872,6 +860,52 @@ export class PipelineOrchestrator {
       message: `failed after ${maxAttempts} attempt(s) — using slate.\n${String((lastErr as any)?.message ?? lastErr)}`,
     });
     return null;
+  }
+
+  /**
+   * Produce the narration, or return undefined and let the demo be silent.
+   *
+   * A TTS failure used to abort the whole run. That was the wrong trade: by this
+   * point the recording has already succeeded — minutes of sandbox time, and a
+   * walkthrough somebody signed into by hand — and a rejected API key threw all
+   * of it away, ending in ERROR with nothing to show. The failure is still
+   * reported on the stage; it just no longer destroys the rest of the work.
+   */
+  private async narrate(
+    sessionId: string,
+    approvedScript: ScriptVersion,
+    sessionDir: string,
+    scriptHash: string,
+    reusable: string | undefined,
+    audioGenerator: AudioGenerator,
+  ): Promise<string | undefined> {
+    const store = this.deps.store;
+
+    if (reusable) {
+      store.setStage(sessionId, 'voiceover', { status: 'done', message: 'reused — script unchanged' });
+      console.log(`[pipeline ${sessionId}] reusing the existing voiceover; the script is unchanged.`);
+      return reusable;
+    }
+
+    try {
+      const audio = await audioGenerator.generate(approvedScript.fullScript, { outputDir: sessionDir });
+      store.update(sessionId, (s) => {
+        s.audio = {
+          url: `${this.deps.publicMediaPrefix}/${sessionId}/${audio.fileName}`,
+          fileName: audio.fileName,
+          bytes: audio.bytes,
+          durationEstimateMs: audio.durationEstimateMs,
+          scriptHash,
+        };
+      });
+      store.setStage(sessionId, 'voiceover', { status: 'done', message: `${Math.round(audio.bytes / 1024)} KB` });
+      return audio.filePath;
+    } catch (err) {
+      const why = String((err as any)?.message ?? err);
+      store.setStage(sessionId, 'voiceover', { status: 'failed', message: why });
+      console.warn(`[pipeline ${sessionId}] no narration, carrying on silent: ${why}`);
+      return undefined;
+    }
   }
 
   /**

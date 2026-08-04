@@ -32,8 +32,14 @@ export const STAGE_DEFS: StageDef[] = [
   // the whole point is that nobody finds out what the demo did afterwards.
   { id: 'flow', label: 'Plan the walkthrough', group: 'generate', dependsOn: ['script'], optional: true },
   { id: 'record', label: 'Screen recording', group: 'generate', dependsOn: [], optional: true },
-  { id: 'voiceover', label: 'Voiceover', group: 'generate', dependsOn: ['script'], optional: false },
-  { id: 'fuse', label: 'Assemble video', group: 'generate', dependsOn: ['voiceover'], optional: false },
+  // Optional, because narration is the one stage that costs real money on
+  // somebody's ElevenLabs key. A silent walkthrough is a legitimate deliverable
+  // and the only way to exercise the pipeline without spending anything.
+  { id: 'voiceover', label: 'Voiceover', group: 'generate', dependsOn: ['script'], optional: true },
+  // Deliberately depends on nothing. Naming `voiceover` here made it a
+  // transitive dependency of a required stage, so `resolveSelectedStages` pulled
+  // narration back in no matter what the caller deselected.
+  { id: 'fuse', label: 'Assemble video', group: 'generate', dependsOn: [], optional: false },
 ];
 
 export const STAGE_IDS: StageId[] = STAGE_DEFS.map((s) => s.id);

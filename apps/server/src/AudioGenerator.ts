@@ -70,8 +70,16 @@ export class AudioGenerator {
         durationEstimateMs: estimateDurationMs(text),
       };
     } catch (error) {
+      const raw = error instanceof Error ? error.message : String(error);
+      // The SDK reports a rejected key as a wall of JSON with a request id in it,
+      // which reads like a Pitchbox fault rather than "your key is wrong".
+      const rejected = /401|unauthorized|invalid_api_key|authentication_error/i.test(raw);
       throw new AudioGeneratorError(
-        error instanceof Error ? `ElevenLabs TTS failed: ${error.message}` : 'ElevenLabs TTS failed',
+        rejected
+          ? 'ElevenLabs rejected the API key (401). Check the key on the run — it must be a current ' +
+            'ElevenLabs key with text-to-speech permission. To produce the demo without narration ' +
+            'instead, turn the Voiceover stage off.'
+          : `ElevenLabs TTS failed: ${raw}`,
         error,
       );
     }
