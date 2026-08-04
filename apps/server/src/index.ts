@@ -945,13 +945,6 @@ app.post('/api/pipeline/:id/login/start', auth, async (req: Request, res: Respon
 
 /** The browser-in-a-browser view. Token-gated; see loginViewer.ts. */
 app.get('/api/pipeline/:id/login/viewer', (req: Request, res: Response) => {
-  const token = typeof req.query.token === 'string' ? req.query.token : undefined;
-  const login = interactiveLogin.authorise(req.params.id, token);
-  if (!login) {
-    res.status(403).type('text/plain').send('Not available.');
-    return;
-  }
-
   // This one page is meant to be embedded by the web front end, which lives on a
   // different origin. Helmet's blanket `X-Frame-Options: SAMEORIGIN` is right for
   // the rest of the server and fatal here: the browser refused to render the
@@ -961,9 +954,30 @@ app.get('/api/pipeline/:id/login/viewer', (req: Request, res: Response) => {
   // X-Frame-Options has no allow-list, so it has to come off and be replaced by
   // `frame-ancestors`, which does. The allowed origins are the same ones already
   // trusted for CORS — no new trust is granted here.
+  //
+  // Set before the token is checked, deliberately: a refusal has to be readable
+  // too. With these applied only on success, an expired token produced the same
+  // blank "refused to connect" as the original bug and hid the actual reason.
   res.removeHeader('X-Frame-Options');
   const frameAncestors = ["'self'", ...(corsOrigins ?? [])].join(' ');
   res.setHeader('Content-Security-Policy', `frame-ancestors ${frameAncestors}`);
+
+  const token = typeof req.query.token === 'string' ? req.query.token : undefined;
+  const login = interactiveLogin.authorise(req.params.id, token);
+  if (!login) {
+    // Terse on purpose — a live browser sits behind this — but rendered as HTML
+    // so it is legible inside the frame.
+    res
+      .status(403)
+      .type('html')
+      .send(
+        '<body style="margin:0;font:13px system-ui;background:#0b0b0f;color:#a1a1aa;' +
+          'display:grid;place-items:center;height:100vh">This sign-in window is no longer available. ' +
+          'Start the run again to open a new one.</body>',
+      );
+    return;
+  }
+
   res.type('html').send(loginViewerHtml(req.params.id, login.token));
 });
 
