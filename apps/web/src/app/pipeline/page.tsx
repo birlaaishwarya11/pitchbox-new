@@ -1117,15 +1117,35 @@ function LoginGateCard(props: {
       )}
 
       {props.viewerUrl ? (
-        <iframe
-          src={props.viewerUrl}
-          title="Sign in to the site being recorded"
-          className="w-full rounded border border-zinc-800 bg-black"
-          style={{ height: 460 }}
-          // The frame drives a browser holding the user's session; nothing in it
-          // needs access to this page.
-          sandbox="allow-scripts allow-same-origin allow-forms"
-        />
+        <>
+          <iframe
+            src={props.viewerUrl}
+            title="Sign in to the site being recorded"
+            className="w-full rounded border border-zinc-800 bg-black"
+            style={{ height: 460 }}
+            // The frame drives a browser holding the user's session; nothing in it
+            // needs access to this page.
+            sandbox="allow-scripts allow-same-origin allow-forms"
+          />
+          {/*
+            A real window, not a nicety. Password managers and OAuth popups behave
+            badly inside an iframe, and if the frame ever fails to render this is
+            still a working way in. Same browser either way — both views drive the
+            one session on the server.
+          */}
+          <p className="text-[11px] text-zinc-500">
+            Trouble typing here, or nothing showing?{' '}
+            <a
+              href={props.viewerUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="underline hover:text-zinc-300"
+            >
+              Open the browser in a new tab
+            </a>{' '}
+            — it is the same session, so come back and confirm when you are done.
+          </p>
+        </>
       ) : (
         !failed && <p className="text-xs text-zinc-400">Opening a browser for you…</p>
       )}

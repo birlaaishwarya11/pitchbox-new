@@ -248,9 +248,10 @@ type RecordRequestBody = {
 // value matters: `true` would let a client spoof its own IP via the header.
 app.set('trust proxy', 1);
 
-// Security headers. contentSecurityPolicy is off because this server only
-// returns JSON and static media — it renders no HTML of its own, so a CSP here
-// protects nothing while risking breakage of media playback.
+// Security headers. contentSecurityPolicy is off globally because this server
+// returns JSON and static media, where a CSP protects nothing and risks breaking
+// media playback. The one HTML page it does serve — the login viewer — sets its
+// own CSP on the way out, because it has to be embeddable from the web origin.
 app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.disable('x-powered-by');
 
@@ -950,6 +951,19 @@ app.get('/api/pipeline/:id/login/viewer', (req: Request, res: Response) => {
     res.status(403).type('text/plain').send('Not available.');
     return;
   }
+
+  // This one page is meant to be embedded by the web front end, which lives on a
+  // different origin. Helmet's blanket `X-Frame-Options: SAMEORIGIN` is right for
+  // the rest of the server and fatal here: the browser refused to render the
+  // frame at all, reporting only "<host> refused to connect", which reads like
+  // the server being down rather than a header saying no.
+  //
+  // X-Frame-Options has no allow-list, so it has to come off and be replaced by
+  // `frame-ancestors`, which does. The allowed origins are the same ones already
+  // trusted for CORS — no new trust is granted here.
+  res.removeHeader('X-Frame-Options');
+  const frameAncestors = ["'self'", ...(corsOrigins ?? [])].join(' ');
+  res.setHeader('Content-Security-Policy', `frame-ancestors ${frameAncestors}`);
   res.type('html').send(loginViewerHtml(req.params.id, login.token));
 });
 
