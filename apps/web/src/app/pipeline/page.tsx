@@ -117,6 +117,8 @@ type Session = {
   flowPlanVersions: FlowPlanVersion[];
   approvedFlowPlanId?: string;
   approvedVersionId?: string;
+  /** Names of the secrets set for this run. Never values — there is no read path. */
+  secretNames?: string[];
   audio?: { url: string };
   video?: { url: string };
   finalVideo?: { url: string; fileName: string };
@@ -500,6 +502,11 @@ export default function PipelinePage() {
             onRevise={handleFlowRevise}
             onSaveEdits={handleFlowSaveEdits}
             onApprove={handleFlowApprove}
+            // Reflect the save immediately rather than waiting for the next poll,
+            // so a secret does not appear to have been dropped for a second.
+            onSecretNamesChanged={(names) =>
+              setSession((prev) => (prev ? { ...prev, secretNames: names } : prev))
+            }
           />
         )}
 
@@ -1177,6 +1184,148 @@ function LoginGateCard(props: {
   );
 }
 
+/**
+ * Secrets the walkthrough may type into the product.
+ *
+ * Write-only by construction. Values are held in local state until saved, sent
+ * once, and then dropped — the server has no route that returns one, so a saved
+ * secret can be replaced but never read back. What comes back is the list of
+ * names, which is all this component displays afterwards.
+ */
+function SecretsEditor(props: { session: Session; disabled: boolean; onNamesChanged: (names: string[]) => void }) {
+  const saved = props.session.secretNames ?? [];
+  const [rows, setRows] = useState<{ name: string; value: string }[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [savedJustNow, setSavedJustNow] = useState(false);
+
+  const setRow = (i: number, patch: Partial<{ name: string; value: string }>) =>
+    setRows((prev) => prev.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+
+  const send = async (init: RequestInit, path = '') => {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await authFetch(`${SERVER_BASE}/api/pipeline/${props.session.id}/secrets${path}`, init);
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+      // Clear the values out of the page the moment they are accepted. Leaving
+      // them in React state keeps them in memory and in any error overlay or
+      // devtools inspection for the rest of the session, for no benefit — they
+      // cannot be edited in place, only replaced.
+      setRows([]);
+      setSavedJustNow(true);
+      // The parent polls the run, and the response carries the authoritative
+      // name list, so nothing needs to be reconciled by hand here.
+      if (data.secretNames) props.onNamesChanged(data.secretNames as string[]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveRows = () =>
+    send({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secrets: rows }),
+    });
+
+  const removeOne = (name: string) => send({ method: 'DELETE' }, `/${encodeURIComponent(name)}`);
+
+  return (
+    <div className="rounded border border-zinc-800 bg-zinc-950/40 p-3 space-y-2">
+      <div className="flex items-baseline gap-2">
+        <h3 className="text-xs font-medium">Secrets the demo may type</h3>
+        <span className="text-[11px] text-zinc-500">optional</span>
+      </div>
+      <p className="text-[11px] text-zinc-500">
+        For fields that need a real credential to make the product work — an API key, a token. The value
+        is never sent to the language model, never stored on the run, and never shown on screen: the
+        field is masked before typing starts and stays masked in the video. Reference it in the
+        walkthrough as <code className="text-zinc-400">{'{{secret:NAME}}'}</code>.
+      </p>
+
+      {saved.length > 0 && (
+        <ul className="space-y-1">
+          {saved.map((name) => (
+            <li key={name} className="flex items-center gap-2 text-[11px]">
+              <span className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-zinc-300">{name}</span>
+              <span className="text-zinc-500">•••••••• set</span>
+              <button
+                onClick={() => removeOne(name)}
+                disabled={props.disabled || busy}
+                className="ml-auto text-zinc-500 underline hover:text-zinc-300 disabled:opacity-50"
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {rows.map((row, i) => (
+        <div key={i} className="flex gap-2">
+          <input
+            value={row.name}
+            onChange={(e) => setRow(i, { name: e.target.value })}
+            placeholder="ANTHROPIC_API_KEY"
+            spellCheck={false}
+            autoComplete="off"
+            className="w-2/5 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 font-mono text-[11px]"
+          />
+          <input
+            // A password field: not for the browser's benefit but so the value is
+            // not readable over a shoulder, in a screen share, or in a recording
+            // of the person setting the demo up.
+            type="password"
+            value={row.value}
+            onChange={(e) => setRow(i, { value: e.target.value })}
+            placeholder="value"
+            spellCheck={false}
+            autoComplete="off"
+            className="flex-1 rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-[11px]"
+          />
+          <button
+            onClick={() => setRows((prev) => prev.filter((_, j) => j !== i))}
+            className="text-[11px] text-zinc-500 hover:text-zinc-300"
+          >
+            ✕
+          </button>
+        </div>
+      ))}
+
+      {error && <p className="text-[11px] text-red-400">{error}</p>}
+      {savedJustNow && !rows.length && !error && (
+        <p className="text-[11px] text-emerald-400">Saved. The values are held only for this run.</p>
+      )}
+
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => {
+            setSavedJustNow(false);
+            setRows((prev) => [...prev, { name: '', value: '' }]);
+          }}
+          disabled={props.disabled || busy}
+          className="rounded border border-zinc-700 px-2 py-1 text-[11px] hover:bg-zinc-900 disabled:opacity-50"
+        >
+          Add a secret
+        </button>
+        {rows.length > 0 && (
+          <button
+            onClick={saveRows}
+            disabled={props.disabled || busy || rows.some((r) => !r.name.trim() || !r.value)}
+            className="rounded bg-zinc-100 px-2 py-1 text-[11px] font-medium text-zinc-900 hover:bg-white disabled:opacity-50"
+          >
+            {busy ? 'Saving…' : 'Save secrets'}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function FlowReviewCard(props: {
   session: Session;
   draft: string;
@@ -1187,6 +1336,7 @@ function FlowReviewCard(props: {
   onRevise: () => void;
   onSaveEdits: () => void;
   onApprove: () => void;
+  onSecretNamesChanged: (names: string[]) => void;
 }) {
   const versions = props.session.flowPlanVersions ?? [];
   const latest = versions[versions.length - 1];
@@ -1209,6 +1359,12 @@ function FlowReviewCard(props: {
         This is what Pitchbox will actually do on screen, and everything it will type. Edit it directly,
         or describe what you want changed — then approve to record.
       </p>
+
+      <SecretsEditor
+        session={props.session}
+        disabled={props.busy}
+        onNamesChanged={props.onSecretNamesChanged}
+      />
 
       {planning && <p className="text-xs text-zinc-400">Exploring the product and working out the flow…</p>}
 

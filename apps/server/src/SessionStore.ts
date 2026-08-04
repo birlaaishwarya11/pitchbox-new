@@ -144,6 +144,7 @@ export class SessionStore {
   private readonly sessions = new Map<string, PipelineSession>();
   private readonly rootDir: string;
   private sweeperHandle: NodeJS.Timeout | null = null;
+  private readonly destroyListeners: Array<(id: string) => void> = [];
 
   constructor(rootDir: string) {
     this.rootDir = rootDir;
@@ -273,10 +274,30 @@ export class SessionStore {
     });
   }
 
+  /**
+   * Run something when a session goes away, however it goes away.
+   *
+   * The orchestrator keeps real credentials in maps beside the session — the
+   * app's environment, and the secrets the walkthrough types. Nothing purged
+   * them, so they outlived the run they belonged to and sat in memory until the
+   * process restarted. A session's secrets should not outlive the session.
+   */
+  onDestroy(listener: (id: string) => void): void {
+    this.destroyListeners.push(listener);
+  }
+
   async destroy(id: string): Promise<void> {
     const session = this.sessions.get(id);
     if (!session) return;
     this.sessions.delete(id);
+    for (const listener of this.destroyListeners) {
+      // One bad listener must not strand the others or leave the work dir behind.
+      try {
+        listener(id);
+      } catch (err) {
+        console.warn(`Session destroy listener failed for ${id}:`, err);
+      }
+    }
     await rm(session.workDir, { recursive: true, force: true }).catch(() => {});
   }
 

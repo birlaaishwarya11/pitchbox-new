@@ -8,9 +8,11 @@ import {
   resetCamera,
   moveCursorTo,
   cursorPulse,
+  installSecretMask,
 } from './cinematics/pageScript';
 import type { Beat } from './cinematics/types';
 import { resolveTokens, type DummyIdentity } from './cinematics/dummyIdentity';
+import { resolveSecretTokens } from './security/secrets';
 import { mkdtemp, mkdir, rename, rm, access, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -22,6 +24,18 @@ import puppeteer, {
   type Page,
 } from 'puppeteer';
 import Xvfb from 'xvfb';
+
+/**
+ * What a single run substitutes into the values it types.
+ *
+ * Grouped into one object and passed down per call because this recorder instance
+ * is shared by every run on the server. Held as fields, one run's secrets would be
+ * visible to the next.
+ */
+export interface WalkthroughInputs {
+  identity?: DummyIdentity;
+  secrets?: Record<string, string>;
+}
 
 type ViewportSize = {
   width: number;
@@ -421,6 +435,15 @@ export class Recorder {
       /** Persona substituted into `{{token}}` values as they are typed. */
       identity?: DummyIdentity;
       /**
+       * Real secrets, substituted into `{{secret:NAME}}` values as they are typed
+       * and masked on screen while that happens.
+       *
+       * Passed per call rather than held on the recorder: this instance is shared
+       * across every run on the server, so a field here would hand one run's
+       * credentials to the next.
+       */
+      secrets?: Record<string, string>;
+      /**
        * Record in a browser the caller owns rather than a fresh one.
        *
        * This is what makes a human-driven login usable: the person signs in, and
@@ -453,7 +476,7 @@ export class Recorder {
           tmpOutput,
           options.targetDurationMs,
           options.beats,
-          options.identity,
+          { identity: options.identity, secrets: options.secrets },
           options.browser,
           options.display,
         );
@@ -463,7 +486,7 @@ export class Recorder {
           tmpOutput,
           options.targetDurationMs,
           options.beats,
-          options.identity,
+          { identity: options.identity, secrets: options.secrets },
           options.browser,
         );
       }
@@ -516,7 +539,7 @@ export class Recorder {
     tmpOutput: string,
     targetDurationMs?: number,
     beats?: Beat[],
-    identity?: DummyIdentity,
+    inputs: WalkthroughInputs = {},
     existingBrowser?: Browser,
     existingDisplay?: string,
   ): Promise<void> {
@@ -546,7 +569,7 @@ export class Recorder {
         try {
           await this.instrumentPage(page);
           // A gate with no screenshot side is a no-op, which is exactly right.
-          await this.runWalkthrough(page, walkthrough, targetDurationMs ?? 0, new CaptureGate(), identity);
+          await this.runWalkthrough(page, walkthrough, targetDurationMs ?? 0, new CaptureGate(), inputs);
         } catch (err) {
           console.warn('[recorder] walkthrough aborted:', describeError(err));
         }
@@ -600,7 +623,7 @@ export class Recorder {
     tmpOutput: string,
     targetDurationMs?: number,
     beats?: Beat[],
-    identity?: DummyIdentity,
+    inputs: WalkthroughInputs = {},
     existingBrowser?: Browser,
   ): Promise<void> {
     let ffmpegProcess: ChildProcessWithoutNullStreams | undefined;
@@ -667,7 +690,7 @@ export class Recorder {
       // Either the walkthrough drives the app, or we fall back to scrolling.
       // Both are fire-and-forget: they drive motion while frames are captured.
       const scrollPromise = hasWalkthrough
-        ? this.runWalkthrough(page, walkthrough, targetDurationMs ?? 0, gate, identity).catch((err) => {
+        ? this.runWalkthrough(page, walkthrough, targetDurationMs ?? 0, gate, inputs).catch((err) => {
             console.warn('[recorder] walkthrough aborted:', err);
           })
         : this.scrollToBottom(page).catch(() => undefined);
@@ -1251,7 +1274,7 @@ export class Recorder {
     beats: Beat[],
     totalMs: number,
     gate: CaptureGate,
-    identity?: DummyIdentity,
+    inputs: WalkthroughInputs,
   ): Promise<void> {
     const startedAt = Date.now();
 
@@ -1263,7 +1286,7 @@ export class Recorder {
       if (totalMs && Date.now() - startedAt >= totalMs) break;
 
       try {
-        await this.performBeat(page, beat, framing, gate, identity);
+        await this.performBeat(page, beat, framing, gate, inputs);
       } catch (err) {
         // A selector stops resolving whenever the app re-renders differently
         // from how the scout found it. Skip the beat rather than abandoning
@@ -1281,7 +1304,7 @@ export class Recorder {
     beat: Beat,
     framing: boolean,
     gate: CaptureGate,
-    identity?: DummyIdentity,
+    inputs: WalkthroughInputs,
   ): Promise<void> {
     if (beat.action === 'goto') {
       if (!beat.url) return;
@@ -1307,13 +1330,33 @@ export class Recorder {
     }
 
     if (beat.action === 'type') {
-      const value = identity ? resolveTokens(beat.value ?? '', identity) : (beat.value ?? '');
+      // Secrets first, then identity tokens. A secret's value is substituted here
+      // and nowhere earlier: the beat that arrived from the director holds only
+      // `{{secret:NAME}}`, so nothing upstream of this line ever held the value.
+      const fromPlan = beat.value ?? '';
+      const resolved = resolveSecretTokens(fromPlan, inputs.secrets ?? {});
+      const value = inputs.identity ? resolveTokens(resolved.text, inputs.identity) : resolved.text;
       if (!value) return;
+
+      if (resolved.missingNames.length) {
+        // Named but not supplied. Logged by name — the point of the message is to
+        // say which one is missing.
+        console.warn(
+          `[recorder] the plan asked for secret(s) that were not supplied: ${resolved.missingNames.join(', ')}`,
+        );
+      }
       // Select whatever is in the field first, so typing replaces rather than
       // appends. `keyboard.type` only ever appends, and a field that already had
       // content — a re-fill, a browser autofill, a value the app pre-populated —
       // ended up holding both. A password typed into twice is not a password,
       // and the resulting login failure looks nothing like its cause.
+      // Mask before the click, not just before the keystrokes: a field that was
+      // pre-filled would otherwise show its contents for the duration of the
+      // triple-click that selects them.
+      if (resolved.usedNames.length) {
+        await this.maskField(page, beat.selector);
+      }
+
       await this.pointAndClick(page, beat.selector, gate, 3);
       // Typed rather than assigned: a controlled React input ignores a value
       // set on the element, and the viewer should see the characters appear.
@@ -1338,6 +1381,38 @@ export class Recorder {
    * disagree, and Puppeteer's selector click scrolls the element into view,
    * which would yank the page out from under the camera mid-shot.
    */
+  /**
+   * Hide what is about to be typed into a field, permanently.
+   *
+   * Never undone. Restoring the field after typing would put the value on screen,
+   * which is the entire thing being prevented — so once a field has held a secret
+   * it stays masked for the rest of the recording. Masked dots in the finished
+   * video are the correct picture of "a key was entered here".
+   *
+   * Done with a stylesheet rule keyed off an attribute rather than by flipping
+   * `type` to `password`: a controlled React input re-renders on every keystroke
+   * and would reset the `type` prop mid-word, unmasking the rest of the value. A
+   * rule carrying `!important` survives that, because React never sees it.
+   */
+  private async maskField(page: Page, selector: string | undefined): Promise<void> {
+    if (!selector) return;
+    let masked = false;
+    try {
+      masked = await page.evaluate(installSecretMask, selector);
+    } catch (err) {
+      throw new Error(
+        `Refusing to type a secret into ${selector}: the field could not be masked (${
+          err instanceof Error ? err.message : String(err)
+        }).`,
+      );
+    }
+    if (!masked) {
+      // Refuse rather than proceed. Typing a credential into a field we could not
+      // find is how it ends up rendered somewhere unexpected, on camera.
+      throw new Error(`Refusing to type a secret: no element matched ${selector}, so it could not be masked.`);
+    }
+  }
+
   private async pointAndClick(
     page: Page,
     selector: string,

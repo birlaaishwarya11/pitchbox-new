@@ -25,6 +25,7 @@ import type { Recorder } from './Recorder';
 import type { SlateRenderer } from './SlateRenderer';
 import { resolveSelectedStages, type StageId } from './pipelineStages';
 import { mediaSemaphore } from './concurrency';
+import { describeSecrets, redactSecrets, referencesSecret, secretNames } from './security/secrets';
 
 // Recording is the flakiest stage; total attempts = 1 try + (this - 1) retries.
 const RECORD_MAX_ATTEMPTS = 2;
@@ -167,6 +168,16 @@ export class PipelineOrchestrator {
    */
   private readonly appEnvBySession = new Map<string, Record<string, string>>();
   /**
+   * Secrets the walkthrough types into the product, kept beside the session for
+   * the same reason as `appEnvBySession` and one more.
+   *
+   * These go through an LLM's neighbourhood — the director plans the beat that
+   * uses one — so the split is not merely about HTTP responses. Only the *names*
+   * are ever passed to a model; the values live here and are read exactly once,
+   * by the recorder, at the keystroke. See `security/secrets.ts`.
+   */
+  private readonly secretsBySession = new Map<string, Record<string, string>>();
+  /**
    * Browsers a caller signed into by hand, waiting to be explored and filmed.
    *
    * Held here rather than on the session because a live browser is not
@@ -179,7 +190,68 @@ export class PipelineOrchestrator {
     { browser: Browser; display: string; shutdown: () => Promise<void> }
   >();
 
-  constructor(private readonly deps: PipelineDeps) {}
+  constructor(private readonly deps: PipelineDeps) {
+    // Everything held beside a session dies with it. Without this the credential
+    // maps grew for the process lifetime, long after the runs they belonged to
+    // had finished.
+    this.deps.store.onDestroy((sessionId) => {
+      this.secretsBySession.delete(sessionId);
+      this.appEnvBySession.delete(sessionId);
+      this.agentsBySession.delete(sessionId);
+      this.siteMapBySession.delete(sessionId);
+      const browser = this.loginBrowserBySession.get(sessionId);
+      if (browser) {
+        this.loginBrowserBySession.delete(sessionId);
+        void browser.shutdown().catch(() => undefined);
+      }
+    });
+  }
+
+  /**
+   * Add or overwrite secrets by name, leaving the rest alone.
+   *
+   * Merge rather than replace, because of what the caller can and cannot know: a
+   * value cannot be read back, so a UI adding a second secret has no way to
+   * resend the first. Replace semantics would silently delete every secret
+   * already set each time another was added.
+   *
+   * Returns the names, which is all a caller ever gets back.
+   */
+  mergeSecrets(sessionId: string, secrets: Record<string, string>): string[] {
+    this.requireSession(sessionId);
+    const merged = { ...(this.secretsBySession.get(sessionId) ?? {}), ...secrets };
+    this.secretsBySession.set(sessionId, merged);
+    console.log(`[pipeline ${sessionId}] secrets now set: ${describeSecrets(merged)}`);
+    return secretNames(merged);
+  }
+
+  /** Forget one secret. Returns the names that remain. */
+  removeSecret(sessionId: string, name: string): string[] {
+    this.requireSession(sessionId);
+    const current = { ...(this.secretsBySession.get(sessionId) ?? {}) };
+    delete current[name];
+    if (Object.keys(current).length) this.secretsBySession.set(sessionId, current);
+    else this.secretsBySession.delete(sessionId);
+    console.log(`[pipeline ${sessionId}] secret removed: ${name}`);
+    return secretNames(current);
+  }
+
+  /** The names of a run's secrets. Safe for API responses, logs and prompts. */
+  secretNamesFor(sessionId: string): string[] {
+    return secretNames(this.secretsBySession.get(sessionId) ?? {});
+  }
+
+  /**
+   * Strip this run's secret values out of text heading for a log or the session.
+   *
+   * The catch-all for paths that cannot be audited one by one: an exception from
+   * a page interaction quoting what it typed, a provider echoing a key it
+   * rejected, a stack trace built by interpolation.
+   */
+  private scrub(sessionId: string, text: string): string {
+    const secrets = this.secretsBySession.get(sessionId);
+    return secrets ? redactSecrets(text, secrets) : text;
+  }
 
   private buildAgents(llm: LlmConfig, audioGenerator: AudioGenerator): SessionAgents {
     const client = createLlmClient(llm);
@@ -446,6 +518,7 @@ export class PipelineOrchestrator {
       durationSec: Math.min(approvedScript.estimatedDurationSec, 120),
       siteMap,
       identity: makeDummyIdentity(`${sessionId}:take`),
+      secretNames: this.secretNamesFor(sessionId),
     });
     store.appendFlowPlanVersion(sessionId, { text });
     store.setStage(sessionId, 'flow', { status: 'done', message: 'waiting for your approval' });
@@ -470,6 +543,7 @@ export class PipelineOrchestrator {
       durationSec: Math.min(approved.estimatedDurationSec, 120),
       siteMap,
       identity: makeDummyIdentity(`${sessionId}:take`),
+      secretNames: this.secretNamesFor(sessionId),
       previous: previous?.text,
       feedback,
     });
@@ -513,8 +587,12 @@ export class PipelineOrchestrator {
     });
 
     void this.runMediaStages(sessionId, approvedScript, options).catch((err) => {
-      console.error(`[pipeline ${sessionId}] media-stage failure:`, err);
-      this.deps.store.setError(sessionId, this.deps.store.get(sessionId)?.status ?? 'GENERATING', String(err?.message ?? err));
+      // Scrubbed on both paths. An error thrown from deep inside a page
+      // interaction can quote the value it was typing, and this message goes to
+      // the log *and* onto the session, which every poll of the run reads back.
+      const message = this.scrub(sessionId, String(err?.message ?? err));
+      console.error(`[pipeline ${sessionId}] media-stage failure: ${message}`);
+      this.deps.store.setError(sessionId, this.deps.store.get(sessionId)?.status ?? 'GENERATING', message);
     });
 
     return this.requireSession(sessionId);
@@ -992,10 +1070,13 @@ export class PipelineOrchestrator {
         identity,
         flowPlan: approvedFlow?.text,
         alreadySignedIn: Boolean(this.loginBrowserBySession.get(session.id)),
+        secretNames: this.secretNamesFor(session.id),
       });
       const actions = walkthrough.beats.filter((b) => b.action !== 'hold' && b.action !== 'scrollTo').length;
+      const withSecrets = walkthrough.beats.filter((b) => referencesSecret(b.value)).length;
       console.log(
-        `[pipeline ${session.id}] directed ${walkthrough.beats.length} beats (${actions} interactions)`,
+        `[pipeline ${session.id}] directed ${walkthrough.beats.length} beats (${actions} interactions` +
+          `${withSecrets ? `, ${withSecrets} using a secret` : ''})`,
       );
 
       return { beats: walkthrough.beats, identity };
@@ -1043,6 +1124,10 @@ export class PipelineOrchestrator {
           // video, not a broken one.
           beats,
           identity,
+          // The only place a value is handed over. The beats above carry
+          // `{{secret:NAME}}`; the recorder substitutes at the keystroke, with the
+          // field already masked.
+          secrets: this.secretsBySession.get(session.id),
         }),
         recordCeilingMs,
         'URL recording',

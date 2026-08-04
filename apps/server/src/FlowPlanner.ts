@@ -61,6 +61,13 @@ export interface FlowPlannerInput {
   siteMap: SiteMap;
   /** The persona whose values will be typed, for context only. */
   identity: DummyIdentity;
+  /**
+   * Names of secrets the run can type — names only, never values.
+   *
+   * Given so the proposed flow can say "pastes the API key into the key field"
+   * and the human reviewing it knows a real credential will be used there.
+   */
+  secretNames?: string[];
   /** The plan being revised, when the caller asked for changes. */
   previous?: string;
   /** What the caller wants different. Free text, in their words. */
@@ -86,6 +93,17 @@ export class FlowPlanner {
       wrapUntrusted('Screens available in this product', describeScreens(input.siteMap)),
       ``,
     ];
+
+    if (input.secretNames?.length) {
+      parts.push(
+        `# Real credentials available`,
+        `The run has supplied these, by name: ${input.secretNames.join(', ')}.`,
+        `You are given the names only; the values are withheld and entered off camera. Where a step`,
+        `needs one, say which name is used — that is what the person reviewing this needs to see.`,
+        `Do not propose a step that needs a credential which is not on this list.`,
+        ``,
+      );
+    }
 
     if (input.previous && input.feedback) {
       parts.push(

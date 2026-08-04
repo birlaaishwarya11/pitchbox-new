@@ -52,6 +52,15 @@ they are substituted at record time:
   {{username}} {{company}} {{jobTitle}} {{phone}} {{url}}
 For anything with no matching token, write a short plausible value.
 
+REAL SECRETS
+Some fields need a real credential to make the product actually work — an API
+key, a token, a licence code. Where the run has supplied one, its NAME is listed
+under SECRETS AVAILABLE below. Write the token {{secret:NAME}} as the value.
+You are never given the value and must not guess at one: a made-up key produces a
+failed request on camera, which is worse than skipping the field. If a field
+plainly needs a credential and no name is listed for it, leave that field out of
+the plan and carry on with the rest.
+
 SEQUENCING
 - Beats run in "atSec" order against the wall clock. The app is in whatever
   state earlier beats left it.
@@ -125,6 +134,14 @@ export interface DirectorInput {
    * that would reveal it.
    */
   alreadySignedIn?: boolean;
+  /**
+   * Names of the secrets this run can type — names only, never values.
+   *
+   * The agent needs to know a credential is available to plan a beat that uses
+   * one, and needs nothing more than the name to write `{{secret:NAME}}`. The
+   * value is substituted in the recorder, at the keystroke.
+   */
+  secretNames?: string[];
 }
 
 export class Director {
@@ -173,6 +190,15 @@ export class Director {
         `Name ${input.identity.fullName} · ${input.identity.email} · ${input.identity.company}.`,
         `Refer to tokens, not these literals.`,
         ``,
+        ...(input.secretNames?.length
+          ? [
+              `# SECRETS AVAILABLE`,
+              `Real credentials the run has supplied. Names only — the values are deliberately withheld`,
+              `from you and are substituted at record time, off camera. Write the token exactly:`,
+              ...input.secretNames.map((name) => `  {{secret:${name}}}`),
+              ``,
+            ]
+          : []),
         // The app is a third party's content, so it is fenced like any other
         // untrusted input — a page could otherwise put instructions in its own
         // copy and steer the edit.

@@ -279,3 +279,39 @@ All scripts can be run from the root:
 - `npm run build:web` - Build only the web app
 - `npm run build:server` - Build only the server
 
+### Secrets the demo types on camera
+
+Some demos need a real credential to show anything — an API key pasted into a
+settings field, a token, a licence code. Set them on the walkthrough-review step,
+or over the API:
+
+```bash
+curl -X POST "$API/api/pipeline/$ID/secrets" \
+  -H 'Content-Type: application/json' \
+  -d '{"secrets":[{"name":"ANTHROPIC_API_KEY","value":"sk-ant-..."}]}'
+# -> {"secretNames":["ANTHROPIC_API_KEY"]}
+
+curl -X DELETE "$API/api/pipeline/$ID/secrets/ANTHROPIC_API_KEY"
+```
+
+Reference one in the walkthrough as `{{secret:NAME}}`. What is guaranteed:
+
+- **The language model never receives a value.** The planner and director are told
+  the names only and write `{{secret:NAME}}`; substitution happens in the recorder
+  at the keystroke.
+- **The value is not in the video.** The field is masked before typing starts and
+  stays masked. If it cannot be masked, the recorder refuses to type rather than
+  film it.
+- **Nothing reads one back.** There is no GET for a value and no field on the
+  session that holds one; responses carry `secretNames`. Values are scrubbed from
+  logs and error messages, and are dropped when the run is evicted.
+
+Write-only and merge-on-save: `POST` adds or overwrites the names you send and
+leaves the rest alone, because a caller cannot resend a value it can no longer
+read. Limits: 20 secrets, 8 KB per value, 32 KB total.
+
+What it cannot promise: if the product itself displays the value after accepting
+it, that is on screen and Pitchbox has no say. And pasting a raw value into the
+walkthrough text box instead of the secrets editor puts it on the session and in a
+prompt — use `{{secret:NAME}}` there.
+

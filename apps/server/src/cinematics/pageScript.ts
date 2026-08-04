@@ -790,3 +790,33 @@ export function cursorPulse(): void {
   void pulse.offsetWidth; // restart the animation
   pulse.classList.add('fire');
 }
+
+/**
+ * Hide the contents of a field, permanently, before a secret is typed into it.
+ *
+ * Lives here with the other page-evaluated code so the recorder and its tests run
+ * the identical script — a masking routine verified in a copy of itself would
+ * prove nothing.
+ *
+ * A stylesheet rule keyed off an attribute, rather than flipping `type` to
+ * `password`: a controlled React input re-renders on every keystroke and would
+ * reset the `type` prop mid-word, unmasking the remainder. React never sees this
+ * rule, and `!important` beats whatever the app's own styles say.
+ *
+ * Returns false when the selector matches nothing, so the caller can refuse to
+ * type rather than film the value.
+ */
+export function installSecretMask(selector: string): boolean {
+  const el = document.querySelector(selector);
+  if (!el) return false;
+  el.setAttribute('data-pbx-secret', '1');
+  const STYLE_ID = 'pbx-secret-mask';
+  if (!document.getElementById(STYLE_ID)) {
+    const style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent =
+      '[data-pbx-secret]{-webkit-text-security:disc !important;text-security:disc !important;}';
+    document.head.appendChild(style);
+  }
+  return true;
+}

@@ -34,6 +34,7 @@ import { TelemetryRecorder } from './usage/TelemetryRecorder';
 import { mintApiKey } from './auth/apiKeys';
 import { assertSafeUrl, BlockedUrlError } from './security/urlGuard';
 import { parseAppEnv, AppEnvError, describeAppEnv } from './security/appEnv';
+import { parseSecrets, SecretError } from './security/secrets';
 import {
   globalLimiter,
   startPipelineLimiter,
@@ -876,6 +877,48 @@ app.post('/api/pipeline/:id/flow', auth, async (req: Request, res: Response) => 
   }
 });
 
+/**
+ * Set the secrets the walkthrough may type into the product.
+ *
+ * Write-only, deliberately. There is no GET returning a value and no field on the
+ * session that holds one — the response is the list of names, which is also all
+ * the planner and director are ever told. A value exists in exactly two places:
+ * this request body, and a map in the orchestrator that the recorder reads at the
+ * keystroke.
+ *
+ * Merges by name rather than replacing the set. A caller cannot read a value
+ * back, so it has no way to resend a secret it saved earlier — replace semantics
+ * would silently drop every existing secret each time another was added. Use
+ * DELETE to remove one.
+ */
+app.post('/api/pipeline/:id/secrets', auth, (req: Request, res: Response) => {
+  const session = getOwnedSession(req, res);
+  if (!session) return;
+
+  try {
+    const parsed = parseSecrets((req.body ?? {}).secrets);
+    if (!Object.keys(parsed).length) {
+      res.status(400).json({ error: 'No secrets supplied.', code: 'INVALID_SECRET' });
+      return;
+    }
+    const names = orchestrator.mergeSecrets(req.params.id, parsed);
+    res.json({ secretNames: names });
+  } catch (error) {
+    if (error instanceof SecretError) {
+      res.status(400).json({ error: error.message, code: 'INVALID_SECRET' });
+      return;
+    }
+    res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Forget one secret. The name is in the path; no value is ever accepted back. */
+app.delete('/api/pipeline/:id/secrets/:name', auth, (req: Request, res: Response) => {
+  const session = getOwnedSession(req, res);
+  if (!session) return;
+  res.json({ secretNames: orchestrator.removeSecret(req.params.id, req.params.name) });
+});
+
 /** Approve the walkthrough and start recording, voiceover and fusion. */
 app.post('/api/pipeline/:id/flow/approve', auth, async (req: Request, res: Response) => {
   const session = sessionStore.get(req.params.id);
@@ -1018,6 +1061,11 @@ function redactSession(session: ReturnType<SessionStore['get']>) {
   // Strip the private _repoSummary stash before sending to the client.
   const { ...rest } = session as any;
   delete rest._repoSummary;
+  // Names only, and derived rather than stored: the session object has no field
+  // holding a secret, so there is nothing here that could leak one even if this
+  // function were bypassed. The UI needs the names to show what is already set
+  // after a reload, since it cannot read back a value it did not just type.
+  rest.secretNames = orchestrator.secretNamesFor(session.id);
   return rest;
 }
 
