@@ -23,6 +23,16 @@ async function authFetch(input: string, init: RequestInit = {}): Promise<Respons
 
 type Status = 'CREATED' | 'PLANNING' | 'RESEARCHING' | 'SCRIPT_DRAFT' | 'AWAITING_LOGIN' | 'FLOW_REVIEW' | 'GENERATING' | 'FUSING' | 'READY' | 'ERROR';
 
+/**
+ * The statuses where the run has stopped and is waiting for a person, and what
+ * that person has to do. Membership of this map is what makes a status a gate.
+ */
+const GATE_PROMPT: Partial<Record<Status, string>> = {
+  AWAITING_LOGIN: 'sign in to the site being recorded',
+  FLOW_REVIEW: 'review what the demo will do',
+  SCRIPT_DRAFT: 'review the script',
+};
+
 type LlmCfg = { provider: string; apiKey: string; model: string };
 type ProviderInfo = {
   id: string;
@@ -31,6 +41,56 @@ type ProviderInfo = {
   keysUrl: string;
   models: { id: string; label: string; free?: boolean }[];
 };
+
+/** What this server can do on its own, from GET /api/providers. */
+type ServerCapabilities = {
+  /** False when the server could not be reached at all — a different problem. */
+  reachable: boolean;
+  providers: ProviderInfo[];
+  hasServerDefault: boolean;
+  hasServerAudio: boolean;
+  hasSandboxRecording: boolean;
+};
+
+// Three separate places need this answer, and it never changes for the life of
+// the page, so it is fetched once and shared rather than once per component.
+let _capabilities: Promise<ServerCapabilities> | null = null;
+function fetchCapabilities(): Promise<ServerCapabilities> {
+  return (_capabilities ??= fetch(`${SERVER_BASE}/api/providers`)
+    .then((r) => r.json())
+    .then((d) => ({
+      reachable: true,
+      providers: (d.providers ?? []) as ProviderInfo[],
+      hasServerDefault: !!d.hasServerDefault,
+      hasServerAudio: !!d.hasServerAudio,
+      hasSandboxRecording: !!d.hasSandboxRecording,
+    }))
+    // Kept distinct from "the server has no keys of its own". Telling someone to
+    // paste an API key when the real problem is that nothing is listening would
+    // send them off fixing the wrong thing.
+    .catch(() => ({
+      reachable: false,
+      providers: [],
+      hasServerDefault: false,
+      hasServerAudio: false,
+      hasSandboxRecording: false,
+    })));
+}
+
+/** Null until the answer arrives — callers must not treat that as "no". */
+function useServerCapabilities(): ServerCapabilities | null {
+  const [caps, setCaps] = useState<ServerCapabilities | null>(null);
+  useEffect(() => {
+    let live = true;
+    fetchCapabilities().then((c) => {
+      if (live) setCaps(c);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+  return caps;
+}
 
 type StageId = 'analyze' | 'plan' | 'research' | 'script' | 'login' | 'flow' | 'record' | 'voiceover' | 'fuse';
 type StageStatus = 'pending' | 'running' | 'done' | 'failed' | 'skipped';
@@ -417,6 +477,39 @@ export default function PipelinePage() {
     setFeedback('');
   };
 
+  // The run is parked and nothing will move until this person acts.
+  const awaitingUser = !!session && !!GATE_PROMPT[session.status];
+
+  const gateRef = useRef<HTMLDivElement | null>(null);
+  const errorRef = useRef<HTMLDivElement | null>(null);
+  const failureRef = useRef<HTMLDivElement | null>(null);
+
+  // A gate renders below a board that is several screens tall, and the run
+  // reaches it while you are watching the stages tick — so bring it to you
+  // rather than leaving it waiting somewhere off-screen.
+  useEffect(() => {
+    if (awaitingUser) gateRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, [awaitingUser, session?.status]);
+
+  // Same reasoning for the two failure surfaces: the request banner sits at the
+  // very top of the page, and the run's own error card at the very bottom.
+  useEffect(() => {
+    if (error) errorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [error]);
+
+  useEffect(() => {
+    if (session?.status === 'ERROR') failureRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [session?.status]);
+
+  // Runs are long enough that people switch tabs. The title is the only thing
+  // they can see from there.
+  useEffect(() => {
+    document.title = awaitingUser ? '● Your turn — Pitchbox' : 'Pitchbox';
+    return () => {
+      document.title = 'Pitchbox';
+    };
+  }, [awaitingUser]);
+
   return (
     <main className="min-h-screen bg-zinc-950 text-zinc-100 p-6 md:p-10">
       <div className="max-w-5xl mx-auto space-y-8">
@@ -439,7 +532,10 @@ export default function PipelinePage() {
         </header>
 
         {error && (
-          <div className="rounded border border-red-900 bg-red-950/40 text-red-200 text-sm p-3 whitespace-pre-wrap">
+          <div
+            ref={errorRef}
+            className="scroll-mt-6 rounded border border-red-900 bg-red-950/40 text-red-200 text-sm p-3 whitespace-pre-wrap"
+          >
             {error}
           </div>
         )}
@@ -463,6 +559,7 @@ export default function PipelinePage() {
             selectedOptional={selectedOptional}
             toggleOptional={toggleOptional}
             onLlmChange={setLlm}
+            llm={llm}
             elevenLabsKey={elevenLabsKey}
             setElevenLabsKey={setElevenLabsKey}
             onStart={handleStart}
@@ -478,49 +575,61 @@ export default function PipelinePage() {
           session.status !== 'FLOW_REVIEW' &&
           session.status !== 'ERROR' && <PreparingCard session={session} />}
 
-        {session && session.status === 'AWAITING_LOGIN' && (
-          <LoginGateCard
-            session={session}
-            viewerUrl={loginViewer}
-            busy={loginBusy}
-            onConfirm={() => loginPost('confirm')}
-            onSkip={() => loginPost('cancel')}
-          />
-        )}
+        {session && awaitingUser && (
+          <div ref={gateRef} className="scroll-mt-6 space-y-3">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-amber-600/40 bg-amber-950/20 px-3 py-2">
+              <span className="inline-block h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
+              <p className="text-sm font-medium text-amber-200">
+                Your turn — {GATE_PROMPT[session.status]}
+              </p>
+              <span className="text-xs text-amber-200/60 sm:ml-auto">Nothing runs until you act</span>
+            </div>
 
-        {session && session.status === 'FLOW_REVIEW' && (
-          <FlowReviewCard
-            session={session}
-            draft={flowDraft}
-            setDraft={(v) => {
-              flowDirty.current = true;
-              setFlowDraft(v);
-            }}
-            feedback={flowFeedback}
-            setFeedback={setFlowFeedback}
-            busy={flowBusy}
-            onRevise={handleFlowRevise}
-            onSaveEdits={handleFlowSaveEdits}
-            onApprove={handleFlowApprove}
-            // Reflect the save immediately rather than waiting for the next poll,
-            // so a secret does not appear to have been dropped for a second.
-            onSecretNamesChanged={(names) =>
-              setSession((prev) => (prev ? { ...prev, secretNames: names } : prev))
-            }
-          />
-        )}
+            {session.status === 'AWAITING_LOGIN' && (
+              <LoginGateCard
+                session={session}
+                viewerUrl={loginViewer}
+                busy={loginBusy}
+                onConfirm={() => loginPost('confirm')}
+                onSkip={() => loginPost('cancel')}
+              />
+            )}
 
-        {session && session.status === 'SCRIPT_DRAFT' && (
-          <ScriptReviewCard
-            session={session}
-            feedback={feedback}
-            setFeedback={setFeedback}
-            iterating={iterating}
-            onFeedback={handleFeedback}
-            onApprove={handleApprove}
-            recordSelected={recordSelected}
-            toggleRecord={() => toggleOptional('record')}
-          />
+            {session.status === 'FLOW_REVIEW' && (
+              <FlowReviewCard
+                session={session}
+                draft={flowDraft}
+                setDraft={(v) => {
+                  flowDirty.current = true;
+                  setFlowDraft(v);
+                }}
+                feedback={flowFeedback}
+                setFeedback={setFlowFeedback}
+                busy={flowBusy}
+                onRevise={handleFlowRevise}
+                onSaveEdits={handleFlowSaveEdits}
+                onApprove={handleFlowApprove}
+                // Reflect the save immediately rather than waiting for the next poll,
+                // so a secret does not appear to have been dropped for a second.
+                onSecretNamesChanged={(names) =>
+                  setSession((prev) => (prev ? { ...prev, secretNames: names } : prev))
+                }
+              />
+            )}
+
+            {session.status === 'SCRIPT_DRAFT' && (
+              <ScriptReviewCard
+                session={session}
+                feedback={feedback}
+                setFeedback={setFeedback}
+                iterating={iterating}
+                onFeedback={handleFeedback}
+                onApprove={handleApprove}
+                recordSelected={recordSelected}
+                toggleRecord={() => toggleOptional('record')}
+              />
+            )}
+          </div>
         )}
 
         {session && session.status === 'READY' && (
@@ -528,7 +637,7 @@ export default function PipelinePage() {
         )}
 
         {session && session.status === 'ERROR' && (
-          <div className="rounded-xl border border-red-900 bg-red-950/30 p-5 space-y-2">
+          <div ref={failureRef} className="scroll-mt-6 rounded-xl border border-red-900 bg-red-950/30 p-5 space-y-2">
             <h2 className="text-lg font-semibold text-red-200">Pipeline error</h2>
             <p className="text-sm text-red-300">
               <span className="text-red-500">stage:</span> {session.error?.stage}
@@ -562,6 +671,63 @@ const SAMPLE_PROMPTS = [
   },
 ];
 
+/**
+ * What will stop this run, worked out before it is launched.
+ *
+ * `PipelineOrchestrator.start()` resolves both keys up front and rejects the
+ * whole request if either is missing — including the voice key, which it needs
+ * even when the voiceover stage is switched off. Saying so next to the button
+ * beats filling the form in and being handed a 400.
+ *
+ * Blockers disable the launch; warnings describe a run that will start and
+ * produce something, just not what the settings suggest.
+ */
+function preflight(a: {
+  caps: ServerCapabilities | null;
+  userPrompt: string;
+  llm: LlmCfg | null;
+  elevenLabsKey: string;
+  githubUrl: string;
+  recordUrl: string;
+  selectedOptional: Set<StageId>;
+}): { blockers: string[]; warnings: string[] } {
+  const blockers: string[] = [];
+  const warnings: string[] = [];
+
+  if (!a.userPrompt.trim()) blockers.push('Say what the video is for — the prompt is empty.');
+
+  // Until the server has answered, claim nothing: flashing "add a key" at
+  // someone who does not need one is worse than a moment of silence.
+  if (a.caps && !a.caps.reachable) {
+    blockers.push(`Cannot reach the Pitchbox server at ${SERVER_BASE} — start it, or check NEXT_PUBLIC_SERVER_BASE.`);
+  } else if (a.caps) {
+    if (!a.llm && !a.caps.hasServerDefault) {
+      blockers.push('Add a model API key — this server has no default of its own.');
+    }
+    if (!a.elevenLabsKey.trim() && !a.caps.hasServerAudio) {
+      blockers.push(
+        'Add an ElevenLabs key — this server has none, and a run is rejected without one even with the voiceover stage off.',
+      );
+    }
+  }
+
+  const hasRepo = !!a.githubUrl.trim();
+  const hasUrl = !!a.recordUrl.trim();
+
+  if (a.selectedOptional.has('record')) {
+    if (!hasUrl && !hasRepo) {
+      warnings.push('Screen recording is on with nothing to record — the video will fall back to a title slate.');
+    } else if (!hasUrl && hasRepo && a.caps && !a.caps.hasSandboxRecording) {
+      warnings.push('Recording a repo needs a sandbox this server does not have — the video will fall back to a title slate.');
+    }
+  }
+  if (a.selectedOptional.has('analyze') && !hasRepo) {
+    warnings.push('Analyze project is on but there is no GitHub URL, so that stage will be skipped.');
+  }
+
+  return { blockers, warnings };
+}
+
 function InputCard(props: {
   userPrompt: string;
   setUserPrompt: (v: string) => void;
@@ -580,12 +746,23 @@ function InputCard(props: {
   selectedOptional: Set<StageId>;
   toggleOptional: (id: StageId) => void;
   onLlmChange: (llm: LlmCfg | null) => void;
+  llm: LlmCfg | null;
   elevenLabsKey: string;
   setElevenLabsKey: (v: string) => void;
   onStart: () => void;
 }) {
   const analyzeOn = props.selectedOptional.has('analyze');
   const recordOn = props.selectedOptional.has('record');
+  const caps = useServerCapabilities();
+  const { blockers, warnings } = preflight({
+    caps,
+    userPrompt: props.userPrompt,
+    llm: props.llm,
+    elevenLabsKey: props.elevenLabsKey,
+    githubUrl: props.githubUrl,
+    recordUrl: props.recordUrl,
+    selectedOptional: props.selectedOptional,
+  });
   return (
     <section className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5 space-y-4">
       <div>
@@ -723,16 +900,56 @@ function InputCard(props: {
             );
           })}
         </div>
-        {recordOn && !props.recordUrl.trim() && (
-          <p className="text-[11px] text-amber-400">Screen recording is on but no URL set — it’ll fall back to a slate.</p>
-        )}
       </div>
 
-      <div className="flex justify-end">
+      {/* Pre-flight: everything known to be wrong, before anything is spent. */}
+      {(blockers.length > 0 || warnings.length > 0) && (
+        <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3 space-y-2">
+          {blockers.length > 0 && (
+            <div className="space-y-1">
+              <p className="text-xs uppercase tracking-widest text-amber-500/80">
+                {blockers.length === 1 ? 'Needed before you can start' : `${blockers.length} things needed before you can start`}
+              </p>
+              <ul className="space-y-1">
+                {blockers.map((b) => (
+                  <li key={b} className="flex gap-2 text-xs text-amber-200">
+                    <span aria-hidden className="text-amber-500">
+                      •
+                    </span>
+                    {b}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {warnings.length > 0 && (
+            <div className="space-y-1">
+              <p className="text-xs uppercase tracking-widest text-zinc-500">Will still run, but</p>
+              <ul className="space-y-1">
+                {warnings.map((w) => (
+                  <li key={w} className="flex gap-2 text-xs text-zinc-400">
+                    <span aria-hidden className="text-zinc-600">
+                      •
+                    </span>
+                    {w}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="flex items-center justify-end gap-3">
+        {blockers.length > 0 && (
+          <p className="text-xs text-zinc-500">Resolve the {blockers.length === 1 ? 'item' : 'items'} above to start</p>
+        )}
         <button
           onClick={props.onStart}
-          disabled={!props.userPrompt.trim()}
-          className="rounded bg-zinc-100 text-zinc-950 text-sm font-medium px-4 py-1.5 hover:bg-white disabled:opacity-40"
+          // Held until the capability check lands, so there is no window where
+          // the button invites a click the server is about to reject.
+          disabled={caps === null || blockers.length > 0}
+          className="rounded bg-zinc-100 text-zinc-950 text-sm font-medium px-4 py-1.5 hover:bg-white disabled:opacity-40 disabled:hover:bg-zinc-100"
         >
           Start pipeline
         </button>
@@ -751,14 +968,8 @@ const CUSTOM_MODEL = '__custom__';
  * outlives the session and is readable by any script on the page.
  */
 function VoiceConfig({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const [hasServerAudio, setHasServerAudio] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    fetch(`${SERVER_BASE}/api/providers`)
-      .then((r) => r.json())
-      .then((d) => setHasServerAudio(!!d.hasServerAudio))
-      .catch(() => setHasServerAudio(false));
-  }, []);
+  const caps = useServerCapabilities();
+  const hasServerAudio = caps ? caps.hasServerAudio : null;
 
   return (
     <div className="rounded-lg border border-zinc-800 bg-zinc-950/50 p-3 space-y-2">
@@ -791,8 +1002,9 @@ function VoiceConfig({ value, onChange }: { value: string; onChange: (v: string)
 }
 
 function ProviderConfig({ onChange }: { onChange: (llm: LlmCfg | null) => void }) {
-  const [providers, setProviders] = useState<ProviderInfo[]>([]);
-  const [hasServerDefault, setHasServerDefault] = useState(false);
+  const caps = useServerCapabilities();
+  const providers = caps?.providers ?? [];
+  const hasServerDefault = !!caps?.hasServerDefault;
   const [providerId, setProviderId] = useState('anthropic');
   const [modelChoice, setModelChoice] = useState('');
   const [customModel, setCustomModel] = useState('');
@@ -803,20 +1015,13 @@ function ProviderConfig({ onChange }: { onChange: (llm: LlmCfg | null) => void }
   const provider = providers.find((p) => p.id === providerId);
   const model = modelChoice === CUSTOM_MODEL ? customModel.trim() : modelChoice;
 
+  // Seed the pickers from the first provider, once the list arrives.
   useEffect(() => {
-    fetch(`${SERVER_BASE}/api/providers`)
-      .then((r) => r.json())
-      .then((d) => {
-        setProviders(d.providers ?? []);
-        setHasServerDefault(!!d.hasServerDefault);
-        const first = (d.providers ?? [])[0];
-        if (first) {
-          setProviderId(first.id);
-          setModelChoice(first.models[0]?.id ?? CUSTOM_MODEL);
-        }
-      })
-      .catch(() => undefined);
-  }, []);
+    const first = caps?.providers[0];
+    if (!first) return;
+    setProviderId(first.id);
+    setModelChoice(first.models[0]?.id ?? CUSTOM_MODEL);
+  }, [caps]);
 
   // Report the resolved config up: a complete BYO config, or null (server default).
   useEffect(() => {
@@ -968,7 +1173,35 @@ function elapsed(s: StageState): string | null {
   return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 }
 
+/**
+ * Wall clock for the whole run: first stage to start, until the last one ends.
+ *
+ * Only READY and ERROR stop the clock. A run parked at a gate is still the
+ * user's run and its minutes still count, so it keeps ticking — the poll that
+ * drives it also drives the re-render.
+ */
+function runElapsed(stages: StageState[], status: Status): string | null {
+  const starts = stages.map((s) => s.startedAt).filter((t): t is string => !!t).map((t) => new Date(t).getTime());
+  if (!starts.length) return null;
+  const ends = stages.map((s) => s.endedAt).filter((t): t is string => !!t).map((t) => new Date(t).getTime());
+  const finished = status === 'READY' || status === 'ERROR';
+  const ms = (finished && ends.length ? Math.max(...ends) : Date.now()) - Math.min(...starts);
+  if (ms < 0) return null;
+  const sec = Math.floor(ms / 1000);
+  return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, '0')}s`;
+}
+
 function AgentBoard({ stages, status }: { stages: StageState[]; status: Status }) {
+  // Skipped stages are not work anyone is waiting on, so they are held out of
+  // the denominator rather than making a complete run read as partly done.
+  const counted = stages.filter((s) => s.status !== 'skipped');
+  const done = counted.filter((s) => s.status === 'done').length;
+  const failed = counted.some((s) => s.status === 'failed');
+  const running = counted.find((s) => s.status === 'running');
+  const skipped = stages.length - counted.length;
+  const pct = counted.length ? Math.round((done / counted.length) * 100) : 0;
+  const t = runElapsed(stages, status);
+
   return (
     <section className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-5 space-y-4">
       <div className="flex items-baseline justify-between">
@@ -976,6 +1209,33 @@ function AgentBoard({ stages, status }: { stages: StageState[]; status: Status }
         <span className="text-[11px] text-zinc-500">
           {status === 'READY' ? 'complete' : status === 'ERROR' ? 'stopped' : 'live · polling 1.5s'}
         </span>
+      </div>
+
+      {/* Overall progress — a board of nine cards does not, on its own, say how
+          far through the run you are or whether anything is still moving. */}
+      <div className="space-y-1.5">
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-xs">
+          <span className="text-zinc-300">
+            {done} of {counted.length} {counted.length === 1 ? 'stage' : 'stages'} done
+          </span>
+          {running && <span className="text-amber-300">· {running.label}</span>}
+          {!running && GATE_PROMPT[status] && <span className="text-amber-300">· waiting on you</span>}
+          {skipped > 0 && <span className="text-zinc-600">· {skipped} skipped</span>}
+          {t && <span className="text-zinc-500 sm:ml-auto">{t} elapsed</span>}
+        </div>
+        <div
+          role="progressbar"
+          aria-valuenow={pct}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-label="Pipeline progress"
+          className="h-1 w-full overflow-hidden rounded-full bg-zinc-800"
+        >
+          <div
+            className={`h-full rounded-full transition-all duration-500 ${failed ? 'bg-rose-500' : 'bg-emerald-500'}`}
+            style={{ width: `${pct}%` }}
+          />
+        </div>
       </div>
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         {GROUPS.map((g) => {
