@@ -114,6 +114,28 @@ export class InteractiveLoginManager {
     const reason = await InteractiveLoginManager.unsupportedReason();
     if (reason) throw new InteractiveLoginError(reason);
 
+    // Idempotent. Starting a second browser for a run that already has a live one
+    // used to tear the first down and issue a fresh token, which silently
+    // invalidated any viewer already open on the old one — the frame then read
+    // "this sign-in window is no longer available" for no reason the user could
+    // see. A page refresh was enough to cause it.
+    //
+    // Worse, it threw away a browser somebody may have been halfway through
+    // signing into. Handing back the existing session is both safer and what the
+    // caller actually wants: one browser per run, however many times it asks.
+    const existing = this.sessions.get(sessionId);
+    if (existing?.browser.connected) {
+      console.log(`[login ${sessionId}] reusing the browser already open on ${existing.display}`);
+      return {
+        token: existing.token,
+        display: existing.display,
+        vncPort: existing.vncPort,
+        expiresAt: existing.expiresAt,
+      };
+    }
+
+    // Either nothing was open, or what was open has died. Clear it out and build
+    // a fresh one.
     await this.stop(sessionId);
 
     const displayNumber = await this.claimDisplay();

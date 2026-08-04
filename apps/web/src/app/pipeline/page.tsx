@@ -181,6 +181,8 @@ export default function PipelinePage() {
   const flowDirty = useRef(false);
   const [loginViewer, setLoginViewer] = useState<string | null>(null);
   const [loginBusy, setLoginBusy] = useState(false);
+  /** Run id we have already asked for a login browser for. See the effect below. */
+  const loginRequestedFor = useRef<string | null>(null);
 
   // Polling
   const pollHandle = useRef<NodeJS.Timeout | null>(null);
@@ -348,6 +350,11 @@ export default function PipelinePage() {
   // is not left looking at a spinner wondering what it wants.
   useEffect(() => {
     if (session?.status !== 'AWAITING_LOGIN' || loginViewer || loginBusy) return;
+    // `loginBusy` and `loginViewer` are state, so they update a tick too late to
+    // stop a second run of this effect from also passing the guard. A ref settles
+    // synchronously, and is keyed by run id so a genuinely new run still asks.
+    if (loginRequestedFor.current === session.id) return;
+    loginRequestedFor.current = session.id;
     let cancelled = false;
     (async () => {
       setLoginBusy(true);
